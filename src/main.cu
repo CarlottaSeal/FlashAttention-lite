@@ -106,10 +106,11 @@ int main(int argc, char** argv)
     CUDA_CHECK(cudaMemcpy(dK, K.data(), K.size() * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(dV, V.data(), V.size() * sizeof(float), cudaMemcpyHostToDevice));
 
-    auto run_naive = [&]() { run_attention_naive(dQ, dK, dV, dO, dS, N, D); };
-    auto run_flash = [&]() { run_attention_flash(dQ, dK, dV, dO, N, D); };
+    auto run_naive  = [&]() { run_attention_naive(dQ, dK, dV, dO, dS, N, D); };
+    auto run_flash  = [&]() { run_attention_flash(dQ, dK, dV, dO, N, D); };
+    auto run_qtile  = [&]() { run_attention_flash_qtile(dQ, dK, dV, dO, N, D); };
 
-    std::vector<float> O_cpu(N * D), O_naive(N * D), O_flash(N * D);
+    std::vector<float> O_cpu(N * D), O_naive(N * D), O_flash(N * D), O_qtile(N * D);
 
     // CPU reference
     auto t0 = std::chrono::steady_clock::now();
@@ -127,15 +128,25 @@ int main(int argc, char** argv)
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(O_flash.data(), dO, O_flash.size() * sizeof(float), cudaMemcpyDeviceToHost));
 
+    // q-tile flash
+    run_qtile();
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(O_qtile.data(), dO, O_qtile.size() * sizeof(float), cudaMemcpyDeviceToHost));
+
     Stats s_n = diff_stats(O_naive, O_cpu);
     Stats s_f = diff_stats(O_flash, O_cpu);
-    std::printf("naive vs cpu-ref:  max|Δ|=%.3e  mean|Δ|=%.3e\n", s_n.max_abs, s_n.mean_abs);
-    std::printf("flash vs cpu-ref:  max|Δ|=%.3e  mean|Δ|=%.3e\n", s_f.max_abs, s_f.mean_abs);
+    Stats s_q = diff_stats(O_qtile, O_cpu);
+    std::printf("naive  vs cpu-ref:  max|Δ|=%.3e  mean|Δ|=%.3e\n", s_n.max_abs, s_n.mean_abs);
+    std::printf("flash  vs cpu-ref:  max|Δ|=%.3e  mean|Δ|=%.3e\n", s_f.max_abs, s_f.mean_abs);
+    std::printf("qtile  vs cpu-ref:  max|Δ|=%.3e  mean|Δ|=%.3e\n", s_q.max_abs, s_q.mean_abs);
 
     float t_naive = time_kernel_ms(3, 10, run_naive);
     float t_flash = time_kernel_ms(3, 10, run_flash);
-    std::printf("naive:  %.3f ms\n", t_naive);
-    std::printf("flash:  %.3f ms  (speedup %.2fx)\n", t_flash, t_naive / t_flash);
+    float t_qtile = time_kernel_ms(3, 10, run_qtile);
+    std::printf("naive: %.3f ms\n", t_naive);
+    std::printf("flash: %.3f ms  (speedup vs naive %.2fx)\n", t_flash, t_naive / t_flash);
+    std::printf("qtile: %.3f ms  (speedup vs naive %.2fx, vs flash %.2fx)\n",
+                t_qtile, t_naive / t_qtile, t_flash / t_qtile);
     std::printf("cpu ref: %.1f ms\n", cpu_ms);
 
     cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO); cudaFree(dS);

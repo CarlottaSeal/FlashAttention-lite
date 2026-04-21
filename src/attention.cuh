@@ -223,3 +223,119 @@ inline void run_attention_flash(const float* dQ, const float* dK, const float* d
     constexpr int D_MAX = 128;
     flash_attn_kernel<BC, D_MAX><<<N, 128, 0, stream>>>(dQ, dK, dV, dO, N, D, scale);
 }
+
+// ---------- FlashAttention v2: Br rows of Q per block, 1 warp per row ----------
+// K/V tile is loaded once per block and reused across Br output rows,
+// amortising the dominant memory-traffic cost of v1.
+template <int BR, int BC, int D_EXACT>
+__global__ __launch_bounds__(BR * 32, 2)
+void flash_attn_qtile_kernel(const float* __restrict__ Q,
+                             const float* __restrict__ K,
+                             const float* __restrict__ V,
+                             float* __restrict__ O,
+                             int N, float scale)
+{
+    int row_base = blockIdx.x * BR;
+    int tid      = threadIdx.x;
+    int warp_id  = tid >> 5;
+    int lane     = tid & 31;
+    int i        = row_base + warp_id;
+
+    __shared__ float sQ[BR][D_EXACT];
+    __shared__ float sO[BR][D_EXACT];
+    __shared__ float sK[BC][D_EXACT];
+    __shared__ float sV[BC][D_EXACT];
+    __shared__ float sS[BR][BC];
+    __shared__ float sm[BR];
+    __shared__ float sl[BR];
+
+    // Cooperatively load Q rows, zero O, init (m, l)
+    for (int k = tid; k < BR * D_EXACT; k += BR * 32) {
+        int r = k / D_EXACT, d = k % D_EXACT;
+        int row_glob = row_base + r;
+        sQ[r][d] = (row_glob < N) ? Q[row_glob * D_EXACT + d] : 0.0f;
+        sO[r][d] = 0.0f;
+    }
+    if (tid < BR) { sm[tid] = -FLT_MAX; sl[tid] = 0.0f; }
+    __syncthreads();
+
+    for (int j0 = 0; j0 < N; j0 += BC)
+    {
+        int tile_rows = min(BC, N - j0);
+
+        for (int k = tid; k < tile_rows * D_EXACT; k += BR * 32) {
+            int b = k / D_EXACT, d = k % D_EXACT;
+            sK[b][d] = K[(j0 + b) * D_EXACT + d];
+            sV[b][d] = V[(j0 + b) * D_EXACT + d];
+        }
+        __syncthreads();
+
+        if (i < N)
+        {
+            // S[b] = (sQ[warp_id] · sK[b]) * scale, lane-parallel dot product + warp reduction
+            for (int b = lane; b < tile_rows; b += 32) {
+                float s = 0.0f;
+                #pragma unroll
+                for (int d = 0; d < D_EXACT; ++d) s += sQ[warp_id][d] * sK[b][d];
+                sS[warp_id][b] = s * scale;
+            }
+
+            // Row max (warp-local, across lanes that touched different b's)
+            float m_tile = -FLT_MAX;
+            for (int b = lane; b < tile_rows; b += 32) m_tile = fmaxf(m_tile, sS[warp_id][b]);
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                m_tile = fmaxf(m_tile, __shfl_xor_sync(0xffffffff, m_tile, off));
+
+            float m_old = sm[warp_id];
+            float m_new = fmaxf(m_old, m_tile);
+            float alpha = expf(m_old - m_new);
+
+            float p_sum = 0.0f;
+            for (int b = lane; b < tile_rows; b += 32) {
+                float p = expf(sS[warp_id][b] - m_new);
+                sS[warp_id][b] = p;
+                p_sum += p;
+            }
+            #pragma unroll
+            for (int off = 16; off > 0; off >>= 1)
+                p_sum += __shfl_xor_sync(0xffffffff, p_sum, off);
+
+            if (lane == 0) {
+                sl[warp_id] = alpha * sl[warp_id] + p_sum;
+                sm[warp_id] = m_new;
+            }
+
+            // O[d] = alpha * O[d] + sum_b P[b] * V[b, d]
+            for (int d = lane; d < D_EXACT; d += 32) {
+                float o = alpha * sO[warp_id][d];
+                for (int b = 0; b < tile_rows; ++b) o += sS[warp_id][b] * sV[b][d];
+                sO[warp_id][d] = o;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (i < N) {
+        float inv_l = 1.0f / sl[warp_id];
+        for (int d = lane; d < D_EXACT; d += 32)
+            O[i * D_EXACT + d] = sO[warp_id][d] * inv_l;
+    }
+}
+
+inline void run_attention_flash_qtile(const float* dQ, const float* dK, const float* dV,
+                                      float* dO, int N, int D, cudaStream_t stream = 0)
+{
+    float scale = 1.0f / sqrtf((float)D);
+    constexpr int BR = 4;
+    constexpr int BC = 32;
+    int grid = (N + BR - 1) / BR;
+    int block = BR * 32;   // 1 warp per Q row
+
+    if (D == 64)
+        flash_attn_qtile_kernel<BR, BC, 64><<<grid, block, 0, stream>>>(dQ, dK, dV, dO, N, scale);
+    else if (D == 128)
+        flash_attn_qtile_kernel<BR, BC, 128><<<grid, block, 0, stream>>>(dQ, dK, dV, dO, N, scale);
+    else
+        std::fprintf(stderr, "run_attention_flash_qtile: D=%d not in {64, 128}\n", D);
+}
