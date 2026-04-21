@@ -117,12 +117,14 @@ int main(int argc, char** argv)
     float_to_half_kernel<<<(nQ + bt - 1) / bt, bt>>>(dV, dVh, nQ);
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    auto run_naive  = [&]() { run_attention_naive(dQ, dK, dV, dO, dS, N, D); };
-    auto run_flash  = [&]() { run_attention_flash(dQ, dK, dV, dO, N, D); };
-    auto run_qtile  = [&]() { run_attention_flash_qtile(dQ, dK, dV, dO, N, D); };
-    auto run_wmma   = [&]() { run_attention_flash_wmma(dQh, dKh, dVh, dO, N, D); };
+    auto run_naive   = [&]() { run_attention_naive(dQ, dK, dV, dO, dS, N, D); };
+    auto run_flash   = [&]() { run_attention_flash(dQ, dK, dV, dO, N, D); };
+    auto run_qtile   = [&]() { run_attention_flash_qtile(dQ, dK, dV, dO, N, D); };
+    auto run_wmma    = [&]() { run_attention_flash_wmma(dQh, dKh, dVh, dO, N, D); };
+    auto run_wmma_v4 = [&]() { run_attention_flash_wmma_v4(dQh, dKh, dVh, dO, N, D); };
 
-    std::vector<float> O_cpu(N * D), O_naive(N * D), O_flash(N * D), O_qtile(N * D), O_wmma(N * D);
+    std::vector<float> O_cpu(N * D), O_naive(N * D), O_flash(N * D), O_qtile(N * D),
+                       O_wmma(N * D), O_wmma_v4(N * D);
 
     // CPU reference
     auto t0 = std::chrono::steady_clock::now();
@@ -145,30 +147,41 @@ int main(int argc, char** argv)
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(O_qtile.data(), dO, O_qtile.size() * sizeof(float), cudaMemcpyDeviceToHost));
 
-    // wmma flash (FP16 input, Tensor Core matmul)
+    // wmma flash v3 (FP16 input, Tensor Core matmul, 1 warp / block)
     run_wmma();
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaMemcpy(O_wmma.data(), dO, O_wmma.size() * sizeof(float), cudaMemcpyDeviceToHost));
 
-    Stats s_n = diff_stats(O_naive, O_cpu);
-    Stats s_f = diff_stats(O_flash, O_cpu);
-    Stats s_q = diff_stats(O_qtile, O_cpu);
-    Stats s_w = diff_stats(O_wmma,  O_cpu);
-    std::printf("naive  vs cpu-ref:  max|Δ|=%.3e  mean|Δ|=%.3e\n", s_n.max_abs, s_n.mean_abs);
-    std::printf("flash  vs cpu-ref:  max|Δ|=%.3e  mean|Δ|=%.3e\n", s_f.max_abs, s_f.mean_abs);
-    std::printf("qtile  vs cpu-ref:  max|Δ|=%.3e  mean|Δ|=%.3e\n", s_q.max_abs, s_q.mean_abs);
-    std::printf("wmma   vs cpu-ref:  max|Δ|=%.3e  mean|Δ|=%.3e  (FP16 input)\n",
-                s_w.max_abs, s_w.mean_abs);
+    // wmma flash v4 (BR=64, 4 warps / block)
+    run_wmma_v4();
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(O_wmma_v4.data(), dO, O_wmma_v4.size() * sizeof(float), cudaMemcpyDeviceToHost));
 
-    float t_naive = time_kernel_ms(3, 10, run_naive);
-    float t_flash = time_kernel_ms(3, 10, run_flash);
-    float t_qtile = time_kernel_ms(3, 10, run_qtile);
-    float t_wmma  = time_kernel_ms(3, 10, run_wmma);
-    std::printf("naive: %.3f ms\n", t_naive);
-    std::printf("flash: %.3f ms  (speedup vs naive %.2fx)\n", t_flash, t_naive / t_flash);
-    std::printf("qtile: %.3f ms  (speedup vs naive %.2fx)\n", t_qtile, t_naive / t_qtile);
-    std::printf("wmma:  %.3f ms  (speedup vs naive %.2fx, vs qtile %.2fx)\n",
+    Stats s_n  = diff_stats(O_naive,   O_cpu);
+    Stats s_f  = diff_stats(O_flash,   O_cpu);
+    Stats s_q  = diff_stats(O_qtile,   O_cpu);
+    Stats s_w  = diff_stats(O_wmma,    O_cpu);
+    Stats s_w4 = diff_stats(O_wmma_v4, O_cpu);
+    std::printf("naive   vs cpu-ref:  max|Δ|=%.3e  mean|Δ|=%.3e\n", s_n.max_abs,  s_n.mean_abs);
+    std::printf("flash   vs cpu-ref:  max|Δ|=%.3e  mean|Δ|=%.3e\n", s_f.max_abs,  s_f.mean_abs);
+    std::printf("qtile   vs cpu-ref:  max|Δ|=%.3e  mean|Δ|=%.3e\n", s_q.max_abs,  s_q.mean_abs);
+    std::printf("wmma v3 vs cpu-ref:  max|Δ|=%.3e  mean|Δ|=%.3e  (FP16 input)\n",
+                s_w.max_abs, s_w.mean_abs);
+    std::printf("wmma v4 vs cpu-ref:  max|Δ|=%.3e  mean|Δ|=%.3e  (FP16 input, BR=64)\n",
+                s_w4.max_abs, s_w4.mean_abs);
+
+    float t_naive   = time_kernel_ms(3, 10, run_naive);
+    float t_flash   = time_kernel_ms(3, 10, run_flash);
+    float t_qtile   = time_kernel_ms(3, 10, run_qtile);
+    float t_wmma    = time_kernel_ms(3, 10, run_wmma);
+    float t_wmma_v4 = time_kernel_ms(3, 10, run_wmma_v4);
+    std::printf("naive:   %.3f ms\n", t_naive);
+    std::printf("flash:   %.3f ms  (vs naive %.2fx)\n", t_flash, t_naive / t_flash);
+    std::printf("qtile:   %.3f ms  (vs naive %.2fx)\n", t_qtile, t_naive / t_qtile);
+    std::printf("wmma v3: %.3f ms  (vs naive %.2fx, vs qtile %.2fx)\n",
                 t_wmma, t_naive / t_wmma, t_qtile / t_wmma);
+    std::printf("wmma v4: %.3f ms  (vs naive %.2fx, vs v3 %.2fx)\n",
+                t_wmma_v4, t_naive / t_wmma_v4, t_wmma / t_wmma_v4);
     std::printf("cpu ref: %.1f ms\n", cpu_ms);
 
     cudaFree(dQ); cudaFree(dK); cudaFree(dV); cudaFree(dO); cudaFree(dS);
