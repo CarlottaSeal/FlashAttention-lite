@@ -1,8 +1,4 @@
-"""torch_bench.py  —  timing reference for PyTorch's scaled_dot_product_attention.
-
-PyTorch uses FlashAttention-2 (FP16, Tensor Cores) on Ada GPUs automatically.
-Included here as a ceiling number to contextualise my FP32 implementations.
-"""
+"""Timing reference for torch.nn.functional.scaled_dot_product_attention."""
 
 import argparse
 import time

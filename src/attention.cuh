@@ -5,12 +5,9 @@
 #include <cmath>
 #include <cfloat>
 
-// All kernels: single-head FP32 attention, non-causal.
-// Shapes (row-major):
-//   Q, K, V, O : [N, D]
-//   scratch    : used by kernels that materialize S[N,N]; caller owns it
+// Single-head, non-causal attention. Q, K, V, O are row-major [N, D].
+// Naive kernels need an S[N,N] scratch buffer; FlashAttention variants don't.
 
-// ---------- naive: materializes S[N,N] in global memory ----------
 __global__ void attn_naive_score_kernel(const float* __restrict__ Q,
                                         const float* __restrict__ K,
                                         float* __restrict__ S,
@@ -98,10 +95,8 @@ inline void run_attention_naive(const float* dQ, const float* dK, const float* d
     }
 }
 
-// ---------- FlashAttention: online softmax, no N×N materialised ----------
-// One block per output row, 128 threads = 4 warps. Block-level cooperation
-// on K/V load, on S-tile compute (warp-reduced dot product per row), and on
-// the O-tile update. Running (m, l) in shared memory.
+// v1: online softmax, one output row per block, 4 warps cooperating on
+// K/V load and the Q·Kᵀ reduction. Running (m, l) in shared memory.
 template <int BC, int D_MAX>
 __global__ void flash_attn_kernel(const float* __restrict__ Q,
                                   const float* __restrict__ K,
@@ -226,9 +221,8 @@ inline void run_attention_flash(const float* dQ, const float* dK, const float* d
     flash_attn_kernel<BC, D_MAX><<<N, 128, 0, stream>>>(dQ, dK, dV, dO, N, D, scale);
 }
 
-// ---------- FlashAttention v2: Br rows of Q per block, 1 warp per row ----------
-// K/V tile is loaded once per block and reused across Br output rows,
-// amortising the dominant memory-traffic cost of v1.
+// v2: Br rows of Q per block, 1 warp per row. K/V tile loaded once per
+// block and reused across all Br rows — amortises v1's dominant memory cost.
 template <int BR, int BC, int D_EXACT>
 __global__ __launch_bounds__(BR * 32, 2)
 void flash_attn_qtile_kernel(const float* __restrict__ Q,
@@ -342,10 +336,9 @@ inline void run_attention_flash_qtile(const float* dQ, const float* dK, const fl
         std::fprintf(stderr, "run_attention_flash_qtile: D=%d not in {64, 128}\n", D);
 }
 
-// ---------- FlashAttention v3: FP16 inputs, Tensor Core matmul (wmma) ----------
-// 16×16 Q/K/V tiles exactly match the wmma 16×16×16 fragment shape.
-// One warp per block. Both matmuls (Q·Kᵀ and P·V) go through Tensor Cores;
-// softmax math and the running (m, l, O) state remain FP32 for accuracy.
+// v3: FP16 input, Tensor Core matmul via wmma. 16×16 Q/K/V tiles match the
+// 16×16×16 fragment shape; one warp per block. Softmax and the running
+// (m, l, O) state stay FP32 for stability.
 template <int D_EXACT>
 __global__ void flash_attn_wmma_kernel(const __half* __restrict__ Q,
                                        const __half* __restrict__ K,

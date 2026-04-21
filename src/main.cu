@@ -22,7 +22,7 @@
     } while (0)
 
 
-// CPU reference: numerically stable, double precision internally.
+// Double-precision stable-softmax reference for correctness checks.
 static void attention_cpu_ref(const float* Q, const float* K, const float* V,
                               float* O, int N, int D)
 {
