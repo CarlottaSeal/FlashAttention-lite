@@ -31,7 +31,7 @@ __global__ void attn_naive_softmax_kernel(float* __restrict__ S, int N)
 
     extern __shared__ float sdata[];
 
-    // max
+    // 求每行最大值
     float mx = -FLT_MAX;
     for (int j = tid; j < N; j += T) mx = fmaxf(mx, row[j]);
     sdata[tid] = mx;
@@ -42,7 +42,7 @@ __global__ void attn_naive_softmax_kernel(float* __restrict__ S, int N)
     }
     mx = sdata[0];
 
-    // exp + sum
+    // 减掉最大值再取 exp，顺便求和
     float sum = 0.0f;
     for (int j = tid; j < N; j += T) {
         float e = expf(row[j] - mx);
@@ -96,7 +96,7 @@ inline void run_attention_naive(const float* dQ, const float* dK, const float* d
 }
 
 // v1: online softmax, one output row per block, 4 warps cooperating on
-// K/V load and the Q·Kᵀ reduction. Running (m, l) in shared memory.
+// K/V load and the Q*K^T reduction. Running (m, l) in shared memory.
 template <int BC, int D_MAX>
 __global__ void flash_attn_kernel(const float* __restrict__ Q,
                                   const float* __restrict__ K,
@@ -136,7 +136,7 @@ __global__ void flash_attn_kernel(const float* __restrict__ Q,
         }
         __syncthreads();
 
-        // S[b] = (Q · K[b]) * scale. Each warp handles BC/NUM_WARPS rows; within
+        // S[b] = (Q * K[b]) * scale. Each warp handles BC/NUM_WARPS rows; within
         // a warp, 32 lanes cooperatively compute one dot product and warp-reduce.
         for (int b = warp_id; b < tile_rows; b += NUM_WARPS) {
             float partial = 0.0f;
@@ -148,10 +148,10 @@ __global__ void flash_attn_kernel(const float* __restrict__ Q,
         }
         __syncthreads();
 
-        // Row max of sS
+        // sS 这一段的行最大值
         float m_tile = -FLT_MAX;
         for (int b = tid; b < tile_rows; b += T) m_tile = fmaxf(m_tile, sS[b]);
-        // Cross-block reduction through shmem (128 threads → 1 value)
+        // 跨 warp 的 shmem 归约：128 线程 -> 1 个值
         __shared__ float red[T / 32];   // one slot per warp
         #pragma unroll
         for (int off = 16; off > 0; off >>= 1)
@@ -170,7 +170,7 @@ __global__ void flash_attn_kernel(const float* __restrict__ Q,
         float m_new = fmaxf(m_old, red[0]);
         float alpha = expf(m_old - m_new);
 
-        // P[b] = exp(S[b] - m_new), accumulate p_sum
+        // P[b] = exp(S[b] - m_new)，顺便累加 p_sum
         float p_sum = 0.0f;
         for (int b = tid; b < tile_rows; b += T) {
             float p = expf(sS[b] - m_new);
@@ -199,7 +199,7 @@ __global__ void flash_attn_kernel(const float* __restrict__ Q,
         }
         __syncthreads();
 
-        // O[d] = alpha * O[d] + sum_b P[b] * V[b, d]
+        // 旧 O 乘 alpha 再加这一块的 P*V：O[d] = alpha*O[d] + sum_b P[b]*V[b,d]
         for (int d = tid; d < D; d += T) {
             float o = alpha * sO[d];
             for (int b = 0; b < tile_rows; ++b) o += sS[b] * sV[b * D + d];
@@ -222,7 +222,7 @@ inline void run_attention_flash(const float* dQ, const float* dK, const float* d
 }
 
 // v2: Br rows of Q per block, 1 warp per row. K/V tile loaded once per
-// block and reused across all Br rows — amortises v1's dominant memory cost.
+// block and reused across all Br rows - amortises v1's dominant memory cost.
 template <int BR, int BC, int D_EXACT>
 __global__ __launch_bounds__(BR * 32, 2)
 void flash_attn_qtile_kernel(const float* __restrict__ Q,
@@ -245,7 +245,7 @@ void flash_attn_qtile_kernel(const float* __restrict__ Q,
     __shared__ float sm[BR];
     __shared__ float sl[BR];
 
-    // Cooperatively load Q rows, zero O, init (m, l)
+    // 协作加载 Q 的几行，O 清零，初始化 (m, l)
     for (int k = tid; k < BR * D_EXACT; k += BR * 32) {
         int r = k / D_EXACT, d = k % D_EXACT;
         int row_glob = row_base + r;
@@ -268,7 +268,7 @@ void flash_attn_qtile_kernel(const float* __restrict__ Q,
 
         if (i < N)
         {
-            // S[b] = (sQ[warp_id] · sK[b]) * scale, lane-parallel dot product + warp reduction
+            // S[b] = (sQ[warp_id] * sK[b]) * scale, lane-parallel dot product + warp reduction
             for (int b = lane; b < tile_rows; b += 32) {
                 float s = 0.0f;
                 #pragma unroll
@@ -302,7 +302,7 @@ void flash_attn_qtile_kernel(const float* __restrict__ Q,
                 sm[warp_id] = m_new;
             }
 
-            // O[d] = alpha * O[d] + sum_b P[b] * V[b, d]
+            // 旧 O 乘 alpha 再加这一块的 P*V：O[d] = alpha*O[d] + sum_b P[b]*V[b,d]
             for (int d = lane; d < D_EXACT; d += 32) {
                 float o = alpha * sO[warp_id][d];
                 for (int b = 0; b < tile_rows; ++b) o += sS[warp_id][b] * sV[b][d];
@@ -336,8 +336,8 @@ inline void run_attention_flash_qtile(const float* dQ, const float* dK, const fl
         std::fprintf(stderr, "run_attention_flash_qtile: D=%d not in {64, 128}\n", D);
 }
 
-// v3: FP16 input, Tensor Core matmul via wmma. 16×16 Q/K/V tiles match the
-// 16×16×16 fragment shape; one warp per block. Softmax and the running
+// v3: FP16 input, Tensor Core matmul via wmma. 16x16 Q/K/V tiles match the
+// 16x16x16 fragment shape; one warp per block. Softmax and the running
 // (m, l, O) state stay FP32 for stability.
 template <int D_EXACT>
 __global__ void flash_attn_wmma_kernel(const __half* __restrict__ Q,
@@ -365,7 +365,7 @@ __global__ void flash_attn_wmma_kernel(const __half* __restrict__ Q,
     __shared__ float  sm[BR];
     __shared__ float  sl[BR];
 
-    // Load Q tile, init O / m / l
+    // 加载 Q tile，初始化 O / m / l
     for (int k = tid; k < BR * D_EXACT; k += 32) {
         int r = k / D_EXACT, d = k % D_EXACT;
         int row = i0 + r;
@@ -382,7 +382,7 @@ __global__ void flash_attn_wmma_kernel(const __half* __restrict__ Q,
     {
         int tile_rows = min(BC, N - j0);
 
-        // Load K, V tiles (FP16)
+        // 加载 K、V tile（FP16）
         for (int k = tid; k < BC * D_EXACT; k += 32) {
             int b = k / D_EXACT, d = k % D_EXACT;
             if (b < tile_rows) {
@@ -395,7 +395,7 @@ __global__ void flash_attn_wmma_kernel(const __half* __restrict__ Q,
         }
         __syncwarp();
 
-        // S = Q · Kᵀ via wmma, accumulated over D/16 tiles
+        // S = Q * K^T via wmma, accumulated over D/16 tiles
         fragment<accumulator, WM, WN, WK, float> s_frag;
         fill_fragment(s_frag, 0.0f);
         #pragma unroll
@@ -409,7 +409,7 @@ __global__ void flash_attn_wmma_kernel(const __half* __restrict__ Q,
         store_matrix_sync(&sS[0][0], s_frag, BC, mem_row_major);
         __syncwarp();
 
-        // Per-row softmax (FP32), write P as FP16, scale stale O by alpha
+        // 逐行 softmax（FP32），P 转 FP16 写出，旧 O 先乘 alpha
         if (tid < BR) {
             int row = tid;
             float m_tile = -FLT_MAX;
@@ -435,7 +435,7 @@ __global__ void flash_attn_wmma_kernel(const __half* __restrict__ Q,
         }
         __syncwarp();
 
-        // O += P · V via wmma, one fragment per D tile
+        // O += P * V via wmma, one fragment per D tile
         #pragma unroll
         for (int kt = 0; kt < D_TILES; ++kt) {
             fragment<accumulator, WM, WN, WK, float>                o_frag;
@@ -451,7 +451,7 @@ __global__ void flash_attn_wmma_kernel(const __half* __restrict__ Q,
         __syncwarp();
     }
 
-    // Final normalize + write to global
+    // 最后归一化，写回 global memory
     if (tid < BR) {
         int row = tid;
         if (i0 + row < N) {
@@ -478,9 +478,9 @@ inline void run_attention_flash_wmma(const __half* dQ, const __half* dK, const _
 
 // v4: BR=64 with 4 warps per block, each warp handles its own 16-row Q slice.
 // K/V tile is loaded once and reused by all 4 warps' wmma matmuls, giving the
-// Tensor Cores 4× the work per SM compared to v3.
+// Tensor Cores 4x the work per SM compared to v3.
 //
-// Uses dynamic shared memory — at D=128, BR=64 the tiles need ~63 KB which
+// Uses dynamic shared memory - at D=128, BR=64 the tiles need ~63 KB which
 // exceeds ptxas's 48 KB static-shmem ceiling. Dynamic shmem with
 // cudaFuncAttributeMaxDynamicSharedMemorySize opts into Ada's 100 KB/SM cap.
 template <int D_EXACT, int NUM_WARPS>
@@ -537,7 +537,7 @@ __global__ void flash_attn_wmma_v4_kernel(const __half* __restrict__ Q,
         }
         __syncthreads();
 
-        // Each warp: Q_slice · Kᵀ via wmma
+        // Each warp: Q_slice * K^T via wmma
         fragment<accumulator, WM, WN, WK, float> s_frag;
         fill_fragment(s_frag, 0.0f);
         #pragma unroll
@@ -551,7 +551,7 @@ __global__ void flash_attn_wmma_v4_kernel(const __half* __restrict__ Q,
         store_matrix_sync(sS + wr_base * BC, s_frag, BC, mem_row_major);
         __syncwarp();
 
-        // Softmax on this warp's 16 rows. First 16 lanes work, others idle.
+        // 对本 warp 负责的 16 行做 softmax，只有前 16 个 lane 干活，其余空转
         if (lane < WARP_BR) {
             int row = wr_base + lane;
             float* sS_row = sS + row * BC;
@@ -581,7 +581,7 @@ __global__ void flash_attn_wmma_v4_kernel(const __half* __restrict__ Q,
         }
         __syncthreads();
 
-        // Each warp: O_slice += P_slice · V via wmma
+        // Each warp: O_slice += P_slice * V via wmma
         #pragma unroll
         for (int kt = 0; kt < D_TILES; ++kt) {
             fragment<accumulator, WM, WN, WK, float>          o_frag;
