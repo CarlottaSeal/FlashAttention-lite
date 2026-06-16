@@ -25,6 +25,19 @@ PyTorch's `scaled_dot_product_attention` (FA-2 + Tensor Cores under the hood)
 is the ceiling I benchmark against. A Triton port (`triton/flash_triton.py`)
 re-expresses the same forward; see the Triton port section below.
 
+## Where this fits in a Transformer
+
+Attention is the core operator of every Transformer layer: a layer is multi-head
+attention followed by a feed-forward network, with residual connections and a norm.
+This kernel implements that operator's forward pass, `softmax(Q*K^T / sqrt(d)) * V`,
+the part that dominates memory traffic at long sequence length. That is the whole
+reason FlashAttention exists.
+
+> Scope, stated honestly: this is the encoder-style attention forward (non-causal),
+> single-head on the CUDA side and multi-head in the Triton port. Add a causal mask,
+> the feed-forward network, the norms, and the backward pass, and it becomes a full
+> GPT block.
+
 ## Online softmax
 
 Softmax of a row is `softmax(x)_j = exp(x_j) / sum_k exp(x_k)`. In practice you
