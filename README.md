@@ -95,6 +95,12 @@ kernel emulates: the multiply runs at FP16 Tensor Core rate while the running su
 keeps FP32 range, so accumulating hundreds of products does not lose precision.
 Softmax (`exp`, the row max, the denominator) stays FP32 for the same reason.
 
+Why the accumulator specifically: summing many products is where low precision hurts,
+because a large running total swallows small new terms. FP16 near 1000 has a step of
+about 0.5, so `1000 + 0.01` rounds straight back to `1000` and the small term is lost;
+FP32 keeps it. The inputs can be FP16, but what they accumulate into sets the precision
+floor, so it stays FP32.
+
 Two details worth knowing. For Q*K^T the K fragment is loaded `col_major`, which
 transposes it for free, so no explicit K^T buffer is needed. And a `D=64` head is
 contracted as four 16-wide tiles (`D / 16`), looping `mma_sync` four times into the
