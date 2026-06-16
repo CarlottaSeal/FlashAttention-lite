@@ -36,6 +36,10 @@ FlashAttention streams over K/V in tiles, so it never holds a whole row at once 
 cannot know the true row max up front. It keeps three running quantities per Q row:
 the max seen so far `m`, the running denominator `l`, and the output accumulator `O`.
 
+The name is the algorithms sense of *online*: consume the stream incrementally with
+no second pass, nothing web-related. The technique predates FlashAttention (Milakov
+and Gimelshein, 2018); this repo implements it, it is not my invention.
+
 When a new tile produces a larger max `m_new > m_old`, everything summed so far used
 a stale max and has to be corrected. The fix-up factor falls out of one identity:
 
