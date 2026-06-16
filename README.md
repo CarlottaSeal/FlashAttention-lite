@@ -16,8 +16,100 @@ the profiler found in the last:
   `cudaFuncSetAttribute`): at D=128, BR=64 wants 63 KB, above ptxas's 48 KB
   static ceiling. **4.11x over naive, 1.59x over v3** at N=4096, D=64.
 
+The baseline these beat is `naive`: the textbook three passes, a score kernel that
+writes the full N×N score matrix to HBM, then a softmax kernel, then an output
+kernel. That N×N round-trip to global memory is exactly what the FlashAttention
+variants avoid.
+
 PyTorch's `scaled_dot_product_attention` (FA-2 + Tensor Cores under the hood)
-is the ceiling I benchmark against.
+is the ceiling I benchmark against. A Triton port (`triton/flash_triton.py`)
+re-expresses the same forward; see the Triton port section below.
+
+## Online softmax
+
+Softmax of a row is `softmax(x)_j = exp(x_j) / sum_k exp(x_k)`. In practice you
+subtract the row max `m` first, `exp(x_j - m) / sum_k exp(x_k - m)`, which is the
+same value (the `exp(-m)` cancels top and bottom) but stops `exp` from overflowing
+to inf on large scores.
+
+FlashAttention streams over K/V in tiles, so it never holds a whole row at once and
+cannot know the true row max up front. It keeps three running quantities per Q row:
+the max seen so far `m`, the running denominator `l`, and the output accumulator `O`.
+
+When a new tile produces a larger max `m_new > m_old`, everything summed so far used
+a stale max and has to be corrected. The fix-up factor falls out of one identity:
+
+```
+exp(x - m_new) = exp(x - m_old) * exp(m_old - m_new)
+                                  \_________________/
+                                        alpha
+```
+
+So before folding in the new tile, rescale the old state by `alpha`:
+
+```
+m_new = max(m_old, rowmax(tile))
+alpha = exp(m_old - m_new)
+l     = alpha * l + sum(exp(tile - m_new))
+O     = alpha * O + P_tile @ V_tile
+```
+
+After the last tile, divide once: `O = O / l`. No N-wide score row ever exists, no
+second pass over the scores, and the result is numerically equivalent to the naive
+two-pass softmax.
+
+Worked example, a row of scores `[1, 3]` arriving as two tiles, `1` then `3`:
+
+```
+tile 1 (sees 1):  m = 1,  l = exp(1-1) = 1,        O = 1 * V1
+tile 2 (sees 3):  m_new = max(1, 3) = 3
+                  alpha = exp(1 - 3) = 0.135
+                  l = 0.135 * 1 + exp(3-3) = 1.135
+                  O = 0.135 * O + 1 * V2
+final:            O = O / l = (0.135 * V1 + V2) / 1.135
+```
+
+A one-shot softmax of `[1, 3]` gives weights `[exp(-2), 1] / 1.135 = [0.119, 0.881]`
+and the same `O`. The streaming pass with the `alpha` rescale is exact, not an
+approximation.
+
+In the code: `attention.cuh:169-171` (m_new, alpha), `:197` (l update), `:204` (the
+`alpha * O` rescale).
+
+## Tensor Cores and wmma
+
+v3 and v4 run the two matmuls (Q*K^T and P*V) on Tensor Cores through the `wmma`
+API (`#include <mma.h>`). A `wmma::fragment` is a small matrix tile spread across the
+32 lanes of one warp; the warp issues a single `mma_sync` that multiplies two input
+fragments and accumulates into a third. Every fragment here is the `16x16x16` shape:
+a 16x16 output tile built from a 16-wide contraction.
+
+The fragment types pin the precision. The two inputs (`matrix_a`, `matrix_b`) are
+`__half` (FP16); the accumulator is `float` (FP32). That is the "FP16 in, FP32
+accumulate" the design notes mention, and it is a hardware feature, not something the
+kernel emulates: the multiply runs at FP16 Tensor Core rate while the running sum
+keeps FP32 range, so accumulating hundreds of products does not lose precision.
+Softmax (`exp`, the row max, the denominator) stays FP32 for the same reason.
+
+Two details worth knowing. For Q*K^T the K fragment is loaded `col_major`, which
+transposes it for free, so no explicit K^T buffer is needed. And a `D=64` head is
+contracted as four 16-wide tiles (`D / 16`), looping `mma_sync` four times into the
+same accumulator. Code: `attention.cuh:399-409` (Q*K^T) and `:439-450` (P*V).
+
+## How it's measured
+
+Correctness and speed are checked separately, by different tools. A kernel can be
+correct and slow (v1 is both).
+
+- **Correctness.** `main.cu` computes a reference on the CPU in double precision
+  (`attention_cpu_ref`), then takes the max absolute elementwise difference against
+  it for each kernel (`diff_stats`). The Correctness table below is that max |Δ|.
+- **Speed.** `time_kernel_ms` runs 3 warmup launches, then times 10 back-to-back
+  launches with one `cudaEvent` pair and divides by 10. The "Nx over naive" figures
+  are just `t_naive / t_kernel`. A fixed RNG seed keeps every run reproducible.
+
+The Nsight metrics further down come from a separate `ncu` profiling run, not from
+this timing harness.
 
 ## Correctness
 
@@ -133,6 +225,33 @@ from the FA-2 paper and code:
 
 Each is a known 1.5-2x win.
 
+## Triton port
+
+`triton/flash_triton.py` re-expresses the same forward in Triton: the identical
+online-softmax tiling, but Triton owns the warp and shared-memory layout and lowers
+the two matmuls to Tensor Cores through `tl.dot`. Multi-head, with Q/K/V laid out
+`[Z, H, N, D]`, non-causal. What the CUDA kernels do by hand (fragment loads, shmem
+staging, the dynamic-shmem opt-in), `tl.dot` and Triton's scheduler do
+automatically: same algorithm, different front-end.
+
+Validated against `torch.scaled_dot_product_attention` to max |Δ| ~6e-5 (FP16).
+
+```bash
+python triton/flash_triton.py
+```
+
+On this Windows torch build the flash / cuDNN SDPA backends aren't compiled in, so
+SDPA falls back to the mem-efficient kernel. The Triton timing beats that, not
+production FlashAttention; benchmarking against true flash needs Linux + flash-attn.
+
+## Requirements
+
+- An NVIDIA GPU. The `wmma` kernels need Tensor Cores (SM 7.0+); developed on Ada
+  (SM 8.9) and Blackwell (SM 12.0). The FP32 paths (naive, v1, v2) run anywhere.
+- CUDA Toolkit: 13.2 for the Blackwell build, 12.x for the Ada build.
+- References only: a CUDA `torch` build, plus `triton` (`triton-windows` on Windows)
+  for the Triton port.
+
 ## Build & run
 
 ```bat
@@ -156,9 +275,29 @@ src/
   main.cu         harness: CPU ref, correctness diff, timing, FP32->FP16 conv kernel
 scripts/
   torch_bench.py  PyTorch SDPA reference (FP32 + FP16)
+triton/
+  flash_triton.py Triton port, multi-head, validated vs torch SDPA
 docs/profile/
   flash.ncu-rep / qtile.ncu-rep / wmma.ncu-rep / wmma_v4.ncu-rep   Nsight Compute, v1-v4
 ```
+
+## Scope and limitations
+
+A deliberately narrow study kernel, kept small so each optimization is isolated and
+measurable:
+
+- **Forward pass only.** No backward; that needs activation recomputation and
+  dQ/dK/dV and is meaningfully harder.
+- **Single head, non-causal** on the CUDA side. The Triton port is multi-head
+  (`[Z, H, N, D]`) but also non-causal, so no causal mask and no skipping of
+  fully-masked tiles.
+- **`D` in {64, 128}, a multiple of 16** to match the wmma tile width. Other head
+  dimensions are unsupported on the wmma paths.
+- **FP16 inputs on v3/v4**, FP32 accumulate. No FP8 path yet.
+- **Single GPU.** No multi-GPU or distributed.
+
+The goal was to take one kernel from a correct baseline to ~4x by profiling one
+bottleneck at a time, not to reimplement production FlashAttention-2.
 
 ## Hardware
 
