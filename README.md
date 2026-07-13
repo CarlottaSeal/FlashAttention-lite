@@ -246,7 +246,9 @@ from the FA-2 paper and code:
 - **Split-K / 8 warps per block.** At very large N, splitting the Q tile across
   more warps and reducing after unlocks more parallelism.
 
-Each is a known 1.5-2x win.
+Each is a known 1.5-2x win. All three are memory-access and scheduling
+optimizations: the online-softmax math and the tiling already match what production
+FlashAttention does, so the remaining gap is implementation, not the algorithm.
 
 ## Triton port
 
