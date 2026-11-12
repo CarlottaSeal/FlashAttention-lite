@@ -37,7 +37,7 @@ def _inner(acc, m_i, l_i, q, k_base, v_base, skn, skk, svn, svk,
 
 
 @triton.jit
-def _flash_fwd(Q, K, V, sm_scale, Out,
+def _flash_fwd(Q, K, V, sm_scale, Out, LSE,
                sqz, sqh, sqm, sqk,
                skz, skh, skn, skk,
                svz, svh, svn, svk,
@@ -88,21 +88,24 @@ def _flash_fwd(Q, K, V, sm_scale, Out,
                                BLOCK_N, False)
 
     acc = acc / l_i[:, None]
+    # backward 用 lse = m + log(l) 一步重算 P = exp(S - lse)
+    tl.store(LSE + off_hz * N + offs_m, m_i + tl.log(l_i), mask=offs_m < N)
     tl.store(o_base + offs_m[:, None] * som + offs_d[None, :] * sok,
              acc.to(Out.dtype.element_ty), mask=offs_m[:, None] < N)
 
 
-def flash_attn(q, k, v, causal=False, skip=True, BLOCK_M=64, BLOCK_N=64):
+def flash_attn(q, k, v, causal=False, skip=True, BLOCK_M=64, BLOCK_N=64, return_lse=False):
     Z, H, N, D = q.shape
     assert BLOCK_M % BLOCK_N == 0   # 对角线起点要落在 BLOCK_N 边界上
     sm_scale = 1.0 / (D ** 0.5)
     o = torch.empty_like(q)
+    lse = torch.empty(Z, H, N, device=q.device, dtype=torch.float32)
     grid = (triton.cdiv(N, BLOCK_M), Z * H)
-    _flash_fwd[grid](q, k, v, sm_scale, o,
+    _flash_fwd[grid](q, k, v, sm_scale, o, lse,
                      *q.stride(), *k.stride(), *v.stride(), *o.stride(),
                      H, N, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, D=D,
                      CAUSAL=causal, SKIP=skip)
-    return o
+    return (o, lse) if return_lse else o
 
 
 CONFIGS = [triton.Config({'BLOCK_M': bm, 'BLOCK_N': bn}, num_warps=w, num_stages=s)
@@ -114,11 +117,29 @@ _flash_fwd_tuned = triton.autotune(CONFIGS, key=['N', 'D', 'CAUSAL'])(_flash_fwd
 def flash_attn_tuned(q, k, v, causal=False):
     Z, H, N, D = q.shape
     o = torch.empty_like(q)
+    lse = torch.empty(Z, H, N, device=q.device, dtype=torch.float32)
     grid = lambda meta: (triton.cdiv(N, meta['BLOCK_M']), Z * H)
-    _flash_fwd_tuned[grid](q, k, v, 1.0 / (D ** 0.5), o,
+    _flash_fwd_tuned[grid](q, k, v, 1.0 / (D ** 0.5), o, lse,
                            *q.stride(), *k.stride(), *v.stride(), *o.stride(),
                            H, N, D=D, CAUSAL=causal)
     return o
+
+
+class FlashAttn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, k, v, causal=False):
+        o, lse = flash_attn(q, k, v, causal, return_lse=True)
+        ctx.save_for_backward(q, k, v, o, lse)
+        ctx.causal = causal
+        return o
+
+    @staticmethod
+    def backward(ctx, do):
+        raise NotImplementedError
+
+
+def attention(q, k, v, causal=False):
+    return FlashAttn.apply(q, k, v, causal)
 
 
 def _bench(fn, iters=50, warmup=10):

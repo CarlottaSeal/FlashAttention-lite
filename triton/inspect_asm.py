@@ -14,8 +14,9 @@ BLOCK_M, BLOCK_N = 64, 64
 def launch(num_stages):
     q, k, v = (torch.randn(1, 1, N, D, device='cuda', dtype=torch.float16) for _ in range(3))
     o = torch.empty_like(q)
+    lse = torch.empty(N, device='cuda')
     grid = ((N + BLOCK_M - 1) // BLOCK_M, 1)
-    kern = _flash_fwd[grid](q, k, v, 1.0 / D ** 0.5, o,
+    kern = _flash_fwd[grid](q, k, v, 1.0 / D ** 0.5, o, lse,
                             *q.stride(), *k.stride(), *v.stride(), *o.stride(),
                             1, N, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, D=D,
                             num_warps=4, num_stages=num_stages)
