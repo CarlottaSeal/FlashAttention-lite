@@ -64,9 +64,11 @@ def _flash_fwd(Q, K, V, sm_scale, Out, LSE,
                 mask=offs_m[:, None] < N, other=0.0)
 
     # 在线 softmax 的运行状态：行最大值 m、归一化和 l、输出累加器 acc
-    m_i = tl.full([BLOCK_M], -float('inf'), tl.float32)
-    l_i = tl.zeros([BLOCK_M], tl.float32)
-    acc = tl.zeros([BLOCK_M, D], tl.float32)
+    # fp64 输入（gradcheck）走 fp64 累加，其余 fp32
+    ACC: tl.constexpr = tl.float64 if Q.dtype.element_ty == tl.float64 else tl.float32
+    m_i = tl.full([BLOCK_M], -float('inf'), ACC)
+    l_i = tl.zeros([BLOCK_M], ACC)
+    acc = tl.zeros([BLOCK_M, D], ACC)
 
     if CAUSAL:
         diag = start_m * BLOCK_M
@@ -99,7 +101,8 @@ def flash_attn(q, k, v, causal=False, skip=True, BLOCK_M=64, BLOCK_N=64, return_
     assert BLOCK_M % BLOCK_N == 0   # 对角线起点要落在 BLOCK_N 边界上
     sm_scale = 1.0 / (D ** 0.5)
     o = torch.empty_like(q)
-    lse = torch.empty(Z, H, N, device=q.device, dtype=torch.float32)
+    lse = torch.empty(Z, H, N, device=q.device,
+                      dtype=torch.float64 if q.dtype == torch.float64 else torch.float32)
     grid = (triton.cdiv(N, BLOCK_M), Z * H)
     _flash_fwd[grid](q, k, v, sm_scale, o, lse,
                      *q.stride(), *k.stride(), *v.stride(), *o.stride(),
@@ -135,7 +138,10 @@ class FlashAttn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do):
-        raise NotImplementedError
+        from flash_bwd import flash_bwd_naive
+        q, k, v, o, lse = ctx.saved_tensors
+        dq, dk, dv = flash_bwd_naive(do, q, k, v, o, lse, ctx.causal)
+        return dq, dk, dv, None
 
 
 def attention(q, k, v, causal=False):
