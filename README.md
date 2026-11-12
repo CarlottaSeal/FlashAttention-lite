@@ -33,9 +33,9 @@ This kernel implements that operator's forward pass, `softmax(Q*K^T / sqrt(d)) *
 the part that dominates memory traffic at long sequence length. That is the whole
 reason FlashAttention exists.
 
-> Scope, stated honestly: this is the encoder-style attention forward (non-causal),
-> single-head on the CUDA side and multi-head in the Triton port. Add a causal mask,
-> the feed-forward network, the norms, and the backward pass, and it becomes a full
+> Scope, stated honestly: this is the attention forward, single-head and
+> non-causal on the CUDA side, multi-head with an optional causal mask in the Triton
+> port. Add the feed-forward network, the norms, and the backward pass, and it becomes a full
 > GPT block.
 
 ## Online softmax
@@ -255,11 +255,13 @@ FlashAttention does, so the remaining gap is implementation, not the algorithm.
 `triton/flash_triton.py` re-expresses the same forward in Triton: the identical
 online-softmax tiling, but Triton owns the warp and shared-memory layout and lowers
 the two matmuls to Tensor Cores through `tl.dot`. Multi-head, with Q/K/V laid out
-`[Z, H, N, D]`, non-causal. What the CUDA kernels do by hand (fragment loads, shmem
+`[Z, H, N, D]`, causal or not. What the CUDA kernels do by hand (fragment loads, shmem
 staging, the dynamic-shmem opt-in), `tl.dot` and Triton's scheduler do
 automatically: same algorithm, different front-end.
 
-Validated against `torch.scaled_dot_product_attention` to max |Δ| ~6e-5 (FP16).
+Validated against `torch.scaled_dot_product_attention` to max |Δ| ~1e-4 (FP16),
+~5e-4 causal. Causal is looser because early rows average only a few V rows, so
+the outputs are larger and so is an FP16 ULP.
 
 ```bash
 python triton/flash_triton.py
@@ -268,6 +270,44 @@ python triton/flash_triton.py
 On this Windows torch build the flash / cuDNN SDPA backends aren't compiled in, so
 SDPA falls back to the mem-efficient kernel. The Triton timing beats that, not
 production FlashAttention; benchmarking against true flash needs Linux + flash-attn.
+
+### Causal mask and tile skip
+
+`flash_attn(q, k, v, causal=True)` masks `S[i, j]` to `-inf` where `j > i`. Done
+naively, every K/V tile still gets loaded, multiplied, and then mostly thrown
+away. For a Q tile covering rows `[m0, m0 + BLOCK_M)`, K/V tiles fall into three
+groups:
+
+- columns entirely `< m0`: fully visible, no mask needed
+- the diagonal tile(s), `[m0, m0 + BLOCK_M)`: masked elementwise
+- columns entirely `>= m0 + BLOCK_M`: fully masked, so never loaded
+
+The kernel runs the inner loop twice, `[0, m0)` with `MASK=False` and the
+diagonal with `MASK=True`, and stops there. `MASK` is a `constexpr`, so the
+unmasked pass compiles without the `tl.where`. `BLOCK_M % BLOCK_N == 0` keeps
+the diagonal on a tile boundary. `skip=False` runs the masked loop over every
+tile, kept for comparison.
+
+FP16, `Z=1, H=16`, RTX 5070 Ti, ms:
+
+| N, D | non-causal | causal, no skip | causal, skip | skip / non-causal | SDPA causal |
+|---|--:|--:|--:|--:|--:|
+| 1024, 64 | 0.059 | 0.060 | 0.048 | 0.81 | 0.095 |
+| 2048, 64 | 0.240 | 0.245 | 0.135 | 0.56 | 0.289 |
+| 4096, 64 | 0.817 | 0.843 | 0.468 | 0.57 | 0.957 |
+| 8192, 64 | 3.311 | 3.387 | 1.758 | 0.53 | 3.454 |
+| 4096, 128 | 2.158 | 2.369 | 1.277 | 0.59 | 2.051 |
+
+Masking without skipping costs 2-10% over non-causal: the extra `tl.where` and
+nothing saved. With skipping, the tiles visited are `T(T+1)/2` out of `T^2` for
+`T = N / 64` Q tiles, a ratio of 0.504 at N=8192, and the measured ratio is 0.53.
+At N=1024 the grid is only 256 CTAs and the ratio drops to 0.81, since launch
+overhead and the tail are a bigger share of a 50 us kernel.
+
+Q tiles are uneven: the last one walks all `T` tiles and the first walks one.
+I tried launching them in reverse, heaviest first, to shorten the tail. The
+difference was within noise (±5%). With `H=16` the grid's fastest dimension
+already interleaves light and heavy tiles across heads in every wave.
 
 ## Triton vs CUDA: under the hood
 
@@ -439,8 +479,7 @@ measurable:
 - **Forward pass only.** No backward; that needs activation recomputation and
   dQ/dK/dV and is meaningfully harder.
 - **Single head, non-causal** on the CUDA side. The Triton port is multi-head
-  (`[Z, H, N, D]`) but also non-causal, so no causal mask and no skipping of
-  fully-masked tiles.
+  (`[Z, H, N, D]`) with an optional causal mask and tile skip.
 - **`D` in {64, 128}, a multiple of 16** to match the wmma tile width. Other head
   dimensions are unsupported on the wmma paths.
 - **FP16 inputs on v3/v4**, FP32 accumulate. No FP8 path yet.
