@@ -33,10 +33,9 @@ This kernel implements that operator's forward pass, `softmax(Q*K^T / sqrt(d)) *
 the part that dominates memory traffic at long sequence length. That is the whole
 reason FlashAttention exists.
 
-> Scope, stated honestly: this is the attention forward, single-head and
-> non-causal on the CUDA side, multi-head with an optional causal mask in the Triton
-> port. Add the feed-forward network, the norms, and the backward pass, and it becomes a full
-> GPT block.
+> Scope, stated honestly: the CUDA side is the attention forward, single-head and
+> non-causal. The Triton port is multi-head, optionally causal, with a backward
+> pass. Add the feed-forward network and the norms, and it becomes a full GPT block.
 
 ## Online softmax
 
@@ -371,6 +370,99 @@ run-to-run noise is the same size as the gap between the top configs.
 python triton/autotune_sweep.py
 ```
 
+### Backward
+
+`attention(q, k, v, causal, bwd='flash' | 'naive')` is a `torch.autograd.Function`.
+The forward saves `lse = m + log(l)` per row (one float per row, `[Z, H, N]`), so
+the backward can rebuild any tile of `P` in one step as `exp(S - lse)` without
+redoing the online max/sum.
+
+The math, per head, with `S = scale * Q K^T` and `P = softmax(S)`:
+
+```
+dV = P^T dO
+dP = dO V^T
+dS = P * (dP - rowsum(P * dP))
+dQ = scale * dS K
+dK = scale * dS^T Q
+```
+
+**Naive** (`flash_bwd.py: flash_bwd_naive`) does exactly that, one kernel per
+line: a batched matmul kernel for the five products, a row kernel for `P` and one
+for `dS`, with `S/P` and `dP/dS` materialized as `[B, N, N]` fp32. Matmuls use
+`input_precision="ieee"` so it stays an exact reference.
+
+**Tiled** (`flash_bwd`) never builds an N x N matrix. Three kernels:
+
+1. `_delta`: `Delta_i = rowsum(dO_i * O_i)`. This equals `rowsum(P_i * dP_i)`,
+   since `sum_j P_ij (dO_i . V_j) = dO_i . sum_j P_ij V_j = dO_i . O_i`, but costs
+   O(N D) instead of O(N^2).
+2. `_bwd_dkdv`: one program per K/V tile. K and V stay in registers. It walks the Q
+   tiles, recomputes `P^T` for the tile from `K Q^T` and `lse`, and accumulates `dV
+   += P^T dO` and `dK += dS^T Q`.
+3. `_bwd_dq`: one program per Q tile, walks the K/V tiles and accumulates `dQ +=
+   dS K`.
+
+dQ needs a sum over K tiles and dK/dV need a sum over Q tiles, so one loop order
+can't own all three. FlashAttention-2 parallelizes over K/V tiles and
+accumulates dQ with atomic adds. I split
+dQ into its own kernel instead, which keeps it deterministic and atomic-free, and
+pays for it by recomputing `Q K^T` and `dO V^T` a second time: 7 matmuls instead
+of 5. Causal skips tiles the same way as the forward. The dK/dV kernel starts at
+the diagonal Q tile, the dQ kernel stops at it, and only the diagonal tile is
+masked.
+
+Correctness: `torch.autograd.gradcheck` passes in fp64 for both versions,
+causal and not, at N=40 and N=100 (tail tiles). The forward accumulates in fp64
+when given fp64 inputs so finite differences hold. In fp16, against an fp32
+PyTorch reference at N=1024, D=64:
+
+| | dq | dk | dv |
+|---|--:|--:|--:|
+| tiled, non-causal | 2.2e-4 | 2.6e-4 | 2.3e-4 |
+| SDPA backward, non-causal | 2.4e-4 | 2.5e-4 | 2.3e-4 |
+| tiled, causal | 1.4e-3 | 1.9e-3 | 1.9e-3 |
+| SDPA backward, causal | 1.4e-3 | 2.0e-3 | 1.9e-3 |
+
+The tiled error is FP16 rounding of `P` and `dS` before they go into `tl.dot`,
+the same as PyTorch's own fp16 backward. Causal is larger because early keys
+collect gradient from many rows, so the values are bigger.
+
+Backward only, `Z=1, H=16`, FP16, ms (peak extra memory in MB):
+
+| N | D | causal | naive | tiled | SDPA |
+|--:|--:|:-:|--:|--:|--:|
+| 1024 | 64 | | 1.72 (146) | **0.21** (6) | 0.40 (12) |
+| 4096 | 64 | | 27.4 (2120) | **2.73** (24) | 5.44 (48) |
+| 8192 | 64 | | - | **10.8** (48) | 22.0 (97) |
+| 4096 | 128 | | 45.9 (2192) | **5.93** (48) | 13.0 (108) |
+| 8192 | 128 | | - | **23.4** (96) | 51.2 (205) |
+| 4096 | 64 | yes | 27.5 (2120) | **1.52** (24) | 3.09 (48) |
+| 8192 | 64 | yes | - | **5.60** (48) | 11.6 (97) |
+| 8192 | 128 | yes | - | **11.9** (96) | 26.0 (205) |
+
+Full grid in `python triton/bwd_bench.py`. Things the numbers show:
+
+- **Memory is the reason tiling exists.** Naive needs two `[B, N, N]` fp32
+  buffers. That's 2 GB at N=4096 and would be 8 GB at N=8192, so it's skipped
+  there. Tiled needs `Delta` plus the outputs.
+- **The 10x over naive isn't all tiling.** Naive also runs fp32 IEEE matmuls
+  without Tensor Cores, and causal doesn't help it at all, since it computes the
+  full matrix and zeroes half.
+- **Backward / forward = 3.3x** (2.73 vs 0.83 ms at N=4096, D=64), close to the 7
+  matmuls vs 2 ratio. Causal tiled lands at 0.51-0.56x of non-causal from N=4096
+  up (0.69-0.73x at N=1024), the same pattern as the forward.
+- **2x faster than SDPA here, with the usual caveat.** On this Windows build SDPA's
+  backward is the mem-efficient kernel, not FlashAttention-2.
+
+At D=128 the backward runs 2 pipeline stages instead of 3. Three stages want
+105 KB of shmem, over the 99 KB limit.
+
+```bash
+python triton/test_bwd.py    # gradcheck + fp16 error
+python triton/bwd_bench.py
+```
+
 ## Triton vs CUDA: under the hood
 
 Same shape for both, single head, `N=2048, D=64`, RTX 5070 Ti. Triton runs
@@ -526,6 +618,9 @@ triton/
   flash_triton.py Triton port, multi-head, validated vs torch SDPA
   inspect_asm.py  dumps Triton TTGIR/PTX/SASS; --profile does one launch for ncu
   autotune_sweep.py  times all 24 autotune configs per shape -> docs/autotune_sweep.csv
+  flash_bwd.py    backward: naive (materialized) and tiled (recompute from lse)
+  test_bwd.py     gradcheck (fp64) + fp16 grads vs fp32 reference
+  bwd_bench.py    backward timing + memory: naive vs tiled vs SDPA
 docs/profile/
   flash.ncu-rep / qtile.ncu-rep / wmma.ncu-rep / wmma_v4.ncu-rep   Nsight Compute, v1-v4 (Ada)
   blackwell_v4.ncu-rep / blackwell_triton.ncu-rep                  v4 vs Triton, --set full (Blackwell)
@@ -539,8 +634,7 @@ docs/asm/
 A deliberately narrow study kernel, kept small so each optimization is isolated and
 measurable:
 
-- **Forward pass only.** No backward; that needs activation recomputation and
-  dQ/dK/dV and is meaningfully harder.
+- **Backward is Triton-only.** The CUDA kernels are forward only.
 - **Single head, non-causal** on the CUDA side. The Triton port is multi-head
   (`[Z, H, N, D]`) with an optional causal mask and tile skip.
 - **`D` in {64, 128}, a multiple of 16** to match the wmma tile width. Other head

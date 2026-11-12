@@ -130,22 +130,22 @@ def flash_attn_tuned(q, k, v, causal=False):
 
 class FlashAttn(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q, k, v, causal=False):
+    def forward(ctx, q, k, v, causal=False, bwd='flash'):
         o, lse = flash_attn(q, k, v, causal, return_lse=True)
         ctx.save_for_backward(q, k, v, o, lse)
-        ctx.causal = causal
+        ctx.causal, ctx.bwd = causal, bwd
         return o
 
     @staticmethod
     def backward(ctx, do):
-        from flash_bwd import flash_bwd_naive
-        q, k, v, o, lse = ctx.saved_tensors
-        dq, dk, dv = flash_bwd_naive(do, q, k, v, o, lse, ctx.causal)
-        return dq, dk, dv, None
+        from flash_bwd import flash_bwd, flash_bwd_naive
+        fn = flash_bwd if ctx.bwd == 'flash' else flash_bwd_naive
+        dq, dk, dv = fn(do, *ctx.saved_tensors, ctx.causal)
+        return dq, dk, dv, None, None
 
 
-def attention(q, k, v, causal=False):
-    return FlashAttn.apply(q, k, v, causal)
+def attention(q, k, v, causal=False, bwd='flash'):
+    return FlashAttn.apply(q, k, v, causal, bwd)
 
 
 def _bench(fn, iters=50, warmup=10):
