@@ -105,6 +105,22 @@ def flash_attn(q, k, v, causal=False, skip=True, BLOCK_M=64, BLOCK_N=64):
     return o
 
 
+CONFIGS = [triton.Config({'BLOCK_M': bm, 'BLOCK_N': bn}, num_warps=w, num_stages=s)
+           for bm in (64, 128) for bn in (32, 64) for w in (4, 8) for s in (2, 3, 4)]
+
+_flash_fwd_tuned = triton.autotune(CONFIGS, key=['N', 'D', 'CAUSAL'])(_flash_fwd)
+
+
+def flash_attn_tuned(q, k, v, causal=False):
+    Z, H, N, D = q.shape
+    o = torch.empty_like(q)
+    grid = lambda meta: (triton.cdiv(N, meta['BLOCK_M']), Z * H)
+    _flash_fwd_tuned[grid](q, k, v, 1.0 / (D ** 0.5), o,
+                           *q.stride(), *k.stride(), *v.stride(), *o.stride(),
+                           H, N, D=D, CAUSAL=causal)
+    return o
+
+
 def _bench(fn, iters=50, warmup=10):
     for _ in range(warmup):
         fn()

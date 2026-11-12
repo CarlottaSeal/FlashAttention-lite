@@ -309,6 +309,68 @@ I tried launching them in reverse, heaviest first, to shorten the tail. The
 difference was within noise (±5%). With `H=16` the grid's fastest dimension
 already interleaves light and heavy tiles across heads in every wave.
 
+### Autotuning
+
+`flash_attn_tuned` wraps the same kernel in `@triton.autotune` over 24 configs,
+`BLOCK_M` {64, 128} x `BLOCK_N` {32, 64} x `num_warps` {4, 8} x `num_stages`
+{2, 3, 4}, keyed on `(N, D, CAUSAL)`. `triton/autotune_sweep.py` times every
+config on every shape (`Z=1, H=16`, N 1024-8192, D 64/128, both modes) with
+`do_bench` and logs registers, spills and shared memory to
+`docs/autotune_sweep.csv`.
+
+Winners, with how far the hand-picked default (64/64, 4 warps, 3 stages) lands
+behind:
+
+| D | mode | winner (BM/BN/warps/stages) | default vs winner |
+|---|---|---|--:|
+| 64 | non-causal | flat: top 3 within 1.4% at every N | 1.01-1.03x |
+| 64 | causal | 64/64/4/3 at every N | 1.00x |
+| 128 | non-causal | 128/64/8/2-3 (128/32/4/2 at N=8192) | 1.22-1.30x |
+| 128 | causal | `BLOCK_M=128` at every N, mostly 128/64/8/3 | 1.05-1.33x |
+
+**The axis that matters is D, not causal.** At D=64 almost any sane config is
+within a few percent, and the causal winner is the default. At D=128 the winner
+moves to `BLOCK_M=128` in both modes. Rows per warp stay at 16 either way
+(128 / 8 warps), but every K/V tile loaded into shmem now serves 128 Q rows
+instead of 64, and at D=128 a K/V tile is twice the bytes, so that reuse is
+worth 20-30%. Causal vs non-causal shifts the nominal winner between configs
+that are within noise of each other.
+
+**The worst configs are 2x slower, and it's a layout problem.** `BLOCK_M=64`
+with 8 warps is the bottom of the table for both D. The TTGIR shows
+`warpsPerCTA = [8, 1]` with `instrShape = [16, 8]`: eight warps along M need
+128 rows, but the tile has 64, so warps 4-7 compute a copy of what warps 0-3
+compute. Per-warp SASS is the same as the 4-warp version (64 HMMA), there are
+just twice as many warps doing it.
+
+**`num_stages`.** Mean time against stages=2, over all 64 runs of each:
+
+| | stages=3 | stages=4 |
+|---|--:|--:|
+| D=64 | 0.95x | 1.00x |
+| D=128 | 1.04x | 1.13x (half the configs don't fit) |
+
+Going from no pipelining to 2 stages is the big step (A1: 0.044 -> 0.040 ms). A
+third buffer helps at D=64 and hurts at D=128. Each stage at `BLOCK_N=64, D=128`
+is 32 KB of K+V. Every `BLOCK_N=64` config with 4 stages goes over the 99 KB
+per-block limit and fails to compile, and `128/64/s3` sits at 96 KB. Occupancy doesn't explain the s2/s3
+difference here, since both are 1 CTA/SM by registers (220 x 256 threads). I
+didn't profile further.
+
+**Spills aren't automatically fatal.** `128/32` with 4 warps at D=128 is 255
+registers and spills 10 (non-causal) or 30 (causal), yet it wins at N=8192 in
+both modes. I haven't profiled why. The spill count is small and spills land in
+L1 first.
+
+**The tuner's own picks.** `@triton.autotune` agreed with the sweep's winner,
+or picked something within 2.6% of it, on 15 of 16 shapes. The exception was
+causal N=1024 D=128 (a 0.11 ms kernel), 9% off. On the sub-0.2 ms shapes,
+run-to-run noise is the same size as the gap between the top configs.
+
+```bash
+python triton/autotune_sweep.py
+```
+
 ## Triton vs CUDA: under the hood
 
 Same shape for both, single head, `N=2048, D=64`, RTX 5070 Ti. Triton runs
@@ -463,6 +525,7 @@ scripts/
 triton/
   flash_triton.py Triton port, multi-head, validated vs torch SDPA
   inspect_asm.py  dumps Triton TTGIR/PTX/SASS; --profile does one launch for ncu
+  autotune_sweep.py  times all 24 autotune configs per shape -> docs/autotune_sweep.csv
 docs/profile/
   flash.ncu-rep / qtile.ncu-rep / wmma.ncu-rep / wmma_v4.ncu-rep   Nsight Compute, v1-v4 (Ada)
   blackwell_v4.ncu-rep / blackwell_triton.ncu-rep                  v4 vs Triton, --set full (Blackwell)
