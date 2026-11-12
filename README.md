@@ -269,6 +269,126 @@ On this Windows torch build the flash / cuDNN SDPA backends aren't compiled in, 
 SDPA falls back to the mem-efficient kernel. The Triton timing beats that, not
 production FlashAttention; benchmarking against true flash needs Linux + flash-attn.
 
+## Triton vs CUDA: under the hood
+
+Same shape for both, single head, `N=2048, D=64`, RTX 5070 Ti. Triton runs
+`BLOCK_M=64, BLOCK_N=64, num_warps=4`; v4 runs `BR=64, BC=16, 4 warps`. Both
+launch 32 CTAs of 128 threads, so the grid and the occupancy are identical and
+the gap comes entirely from what each warp does per K/V tile.
+
+| | CUDA v4 | Triton `num_stages=1` | Triton `num_stages=3` |
+|---|--:|--:|--:|
+| Wall-clock (CUDA events, 200 iters) | 0.457 ms | 0.044 ms | **0.037 ms** |
+| Kernel time under ncu (locked clocks) | 606 us | 61 us | 39 us |
+| Instructions executed | 14.1 M | 2.60 M | 2.60 M |
+| Tensor pipe (HMMA) utilization | 2.2% | 22.6% | **35.3%** |
+| Issue slots busy | 7.4% | 13.6% | 21.8% |
+| Global load requests (same 532,480 sectors) | 266,240 | 33,280 | 33,280 |
+| Shmem bank-conflict wavefronts / total | 19.4 M / 23.7 M | 0 / 0.77 M | 1 / 0.65 M |
+| Registers / thread | 64 | 174 | 152 |
+| Shared memory / block | 35 KB | 16 KB | 40 KB |
+| Stall per issue: long scoreboard | 3.22 | 2.10 | 0.11 |
+| Stall per issue: short scoreboard | 5.62 | 0.40 | 0.42 |
+| Stall per issue: math pipe throttle | 0.11 | 1.41 | 1.43 |
+
+Triton is ~12x faster than v4 on the same shape. Occupancy doesn't explain it
+(8.3% achieved warps on all three), and neither does the Tensor Core instruction.
+Everything else in the loop does.
+
+### The mma is the same instruction
+
+v4 calls `wmma::mma_sync` on 16x16x16 fragments, which PTX spells
+`wmma.mma.sync.aligned.m16n16k16`. Triton's `tl.dot` emits
+`mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32` directly. ptxas lowers both
+to the same SASS, `HMMA.16816.F32`: one wmma becomes two HMMAs. Operand loads
+match too: `wmma::load_matrix_sync` from shmem and Triton's operand loads both
+become `LDSM.16.M88.4` (`ldmatrix`), with `.MT88` for the transposed operand. The
+TTGIR shows `#ttg.nvidia_mma<{versionMajor = 2}>`, the Ampere-style `mma.sync`
+path. sm_120 doesn't have Hopper's `wgmma`, so there's no newer Tensor Core
+instruction that Triton is using and v4 isn't.
+
+What differs is how much work surrounds each HMMA. Inner loop only, normalized to
+64 keys (four v4 iterations against one Triton iteration):
+
+| Per 64 keys, per warp | CUDA v4 | Triton `num_stages=3` |
+|---|--:|--:|
+| SASS instructions | ~3,630 | ~620 |
+| `HMMA.16816.F32` | 64 | 64 |
+| `BAR.SYNC` | 12 | 2 |
+| Global loads | 56x `LDG.E.U16` (2 B) | 8x `LDGSTS.E.BYPASS.128` (16 B, `cp.async`) |
+| Shmem traffic outside `ldmatrix` | ~610 `LDS`/`STS` | 3 `LDS` |
+
+HMMA is 1.8% of v4's loop and 10% of Triton's.
+
+### Where v4's instructions go
+
+**S and O live in shared memory.** v4 writes the `Q*K^T` fragment to `sS`, has 16
+lanes read it back row by row for the softmax, writes `P` to `sP`, then each
+`P*V` step loads the O accumulator from `sO`, runs one mma, and stores it back
+(`attention.cuh:551`, `:590-594`). Triton never spills them: `qk`, `p` and `acc`
+stay in registers in the mma accumulator layout for the whole loop. That costs
+registers (152-174 against v4's 64) and saves the round-trip.
+
+**The softmax is serial.** In v4, lane `r` owns row `r` and walks its 16 columns
+in a loop, while lanes 16-31 idle (`attention.cuh:555`). In Triton's mma
+layout each row is spread across a quad of 4 lanes, so a row max or row sum is
+two `SHFL.BFLY` steps. That's 8 shuffles per tile for both reductions on both rows
+a thread holds.
+
+**Every shmem access conflicts.** 82% of v4's shmem wavefronts are bank-conflict
+replays. Per-instruction source counters put them on every shmem opcode in the
+loop: `LDS.128`/`STS.128` (the O fragment load/store, 21% + 19%), `LDSM` (the Q/K/P
+fragment loads, 20% + 9.5%), and the scalar softmax `LDS`/`STS`. The cause is the
+stride: `D=64` rows are 128 B of FP16 or 256 B of FP32, both multiples of the
+128 B bank cycle, so every row of an 8x8 `ldmatrix` tile, and every lane in the
+softmax `sO_row[d] *= alpha`, lands on the same banks. Triton's shared layout is
+`#ttg.swizzled_shared<{vec = 8, perPhase = 1, maxPhase = 8}>`: 16-byte chunks
+XOR-permuted by `row % 8`, so it measures zero conflicts. That's the swizzle
+v5 has to do by hand.
+
+**Global loads are 2 bytes wide.** v4's cooperative K/V load indexes one `__half`
+per thread per iteration, giving `LDG.E.U16`. Triton's `#blocked` layout gives
+each thread 8 contiguous halves (`sizePerThread = [1, 8]`), so 16-byte loads. The
+bytes moved are identical (532,480 sectors on both), but v4 issues 8x the
+requests.
+
+### What `num_stages` does
+
+`num_stages=1` loads K/V with `LDG.E.128` into registers and `STS.128` into shmem,
+the same two-step pattern v4 uses. From `num_stages=2` up, the TTGIR switches to
+`ttg.async_copy_global_to_local` / `async_commit_group` / `async_wait`, which
+becomes `cp.async.cg.shared.global` (`LDGSTS.E.BYPASS.128`, bypassing L1) with
+`LDGDEPBAR` / `DEPBAR.LE` for the group waits. The prologue issues the first
+tiles before the loop and the loop body issues tile `n+1` while computing tile
+`n`. Shared memory goes from 16 KB to 40 KB for the extra buffers.
+
+The effect shows up in the stalls: long-scoreboard (waiting on global data) goes
+from 2.10 to 0.11 cycles per issue, and the Tensor pipe climbs from 22.6% to
+35.3%. With stages=3 the top non-trivial stall becomes math-pipe throttle, so the
+Tensor Cores are now the limiter. Wall-clock is 0.044 / 0.040 / 0.037 / 0.037 ms
+for stages 1 / 2 / 3 / 4: the second buffer is most of the win and the fourth
+adds nothing at this size.
+
+### What this says about v5
+
+v4's remaining gap isn't the Tensor Core instruction. It's the data movement
+around it. In order of measured cost: keep S/P/O in registers instead of shmem,
+swizzle the shmem tiles, widen global loads to 16 B, and pipeline them with
+`cp.async`. Triton's TTGIR is a working spec for all four, written down by the
+compiler.
+
+Reproduce:
+
+```bash
+python triton/inspect_asm.py     # TTGIR / PTX / SASS for num_stages=1 and 3 -> docs/asm/
+ncu --set full -k regex:_flash_fwd -c 2 python triton/inspect_asm.py --profile
+ncu --set full -k regex:flash_attn_wmma_v4 -c 1 build\bin\attn.exe --N 2048 --D 64
+```
+
+`docs/asm/cuda_v4.{ptx,sass}` is the `flash_attn_wmma_v4_kernel<64,4>` entry cut
+out of `nvcc -arch=sm_120 -ptx` / `cuobjdump -sass` on `src/main.cu`. The two ncu
+reports are in `docs/profile/blackwell_*.ncu-rep`.
+
 ## Requirements
 
 - An NVIDIA GPU. The `wmma` kernels need Tensor Cores (SM 7.0+); developed on Ada
@@ -302,8 +422,13 @@ scripts/
   torch_bench.py  PyTorch SDPA reference (FP32 + FP16)
 triton/
   flash_triton.py Triton port, multi-head, validated vs torch SDPA
+  inspect_asm.py  dumps Triton TTGIR/PTX/SASS; --profile does one launch for ncu
 docs/profile/
-  flash.ncu-rep / qtile.ncu-rep / wmma.ncu-rep / wmma_v4.ncu-rep   Nsight Compute, v1-v4
+  flash.ncu-rep / qtile.ncu-rep / wmma.ncu-rep / wmma_v4.ncu-rep   Nsight Compute, v1-v4 (Ada)
+  blackwell_v4.ncu-rep / blackwell_triton.ncu-rep                  v4 vs Triton, --set full (Blackwell)
+docs/asm/
+  triton_s{1,3}.{ttgir,ptx,sass}   Triton output at num_stages=1 and 3
+  cuda_v4.{ptx,sass}               v4<64,4> from nvcc / cuobjdump
 ```
 
 ## Scope and limitations
