@@ -510,52 +510,6 @@ stays FP16.
 python triton/precision_exp.py
 ```
 
-| Global loads | 56x `LDG.E.U16` (2 B) | 8x `LDGSTS.E.BYPASS.128` (16 B, `cp.async`) |
-| Shmem traffic outside `ldmatrix` | ~610 `LDS`/`STS` | 3 `LDS` |
-
-HMMA is 1.8% of v4's loop and 10% of Triton's.
-
-### Where v4's instructions go
-
-**S and O live in shared memory.** v4 writes the `Q*K^T` fragment to `sS`, has 16
-lanes read it back row by row for the softmax, writes `P` to `sP`, then each
-`P*V` step loads the O accumulator from `sO`, runs one mma, and stores it back
-(`attention.cuh:551`, `:590-594`). Triton never spills them: `qk`, `p` and `acc`
-stay in registers in the mma accumulator layout for the whole loop. That costs
-registers (152-174 against v4's 64) and saves the round-trip.
-
-**The softmax is serial.** In v4, lane `r` owns row `r` and walks its 16 columns
-in a loop, while lanes 16-31 idle (`attention.cuh:555`). In Triton's mma
-layout each row is spread across a quad of 4 lanes, so a row max or row sum is
-two `SHFL.BFLY` steps. That's 8 shuffles per tile for both reductions on both rows
-a thread holds.
-
-**Every shmem access conflicts.** 82% of v4's shmem wavefronts are bank-conflict
-replays. Per-instruction source counters put them on every shmem opcode in the
-loop: `LDS.128`/`STS.128` (the O fragment load/store, 21% + 19%), `LDSM` (the Q/K/P
-fragment loads, 20% + 9.5%), and the scalar softmax `LDS`/`STS`. The cause is the
-stride: `D=64` rows are 128 B of FP16 or 256 B of FP32, both multiples of the
-128 B bank cycle, so every row of an 8x8 `ldmatrix` tile, and every lane in the
-softmax `sO_row[d] *= alpha`, lands on the same banks. Triton's shared layout is
-`#ttg.swizzled_shared<{vec = 8, perPhase = 1, maxPhase = 8}>`: 16-byte chunks
-XOR-permuted by `row % 8`, so it measures zero conflicts. That's the swizzle
-v5 has to do by hand.
-
-**Global loads are 2 bytes wide.** v4's cooperative K/V load indexes one `__half`
-per thread per iteration, giving `LDG.E.U16`. Triton's `#blocked` layout gives
-each thread 8 contiguous halves (`sizePerThread = [1, 8]`), so 16-byte loads. The
-bytes moved are identical (532,480 sectors on both), but v4 issues 8x the
-requests.
-
-### What `num_stages` does
-
-`num_stages=1` loads K/V with `LDG.E.128` into registers and `STS.128` into shmem,
-the same two-step pattern v4 uses. From `num_stages=2` up, the TTGIR switches to
-`ttg.async_copy_global_to_local` / `async_commit_group` / `async_wait`, which
-becomes `cp.async.cg.shared.global` (`LDGSTS.E.BYPASS.128`, bypassing L1) with
-`LDGDEPBAR` / `DEPBAR.LE` for the group waits. The prologue issues the first
-tiles before the loop and the loop body issues tile `n+1` while computing tile
-`n`. Shared memory goes from 16 KB to 40 KB for the extra buffers.
 ## Triton vs CUDA: under the hood
 
 Same shape for both, single head, `N=2048, D=64`, RTX 5070 Ti. Triton runs
@@ -602,6 +556,52 @@ What differs is how much work surrounds each HMMA. Inner loop only, normalized t
 | SASS instructions | ~3,630 | ~620 |
 | `HMMA.16816.F32` | 64 | 64 |
 | `BAR.SYNC` | 12 | 2 |
+| Global loads | 56x `LDG.E.U16` (2 B) | 8x `LDGSTS.E.BYPASS.128` (16 B, `cp.async`) |
+| Shmem traffic outside `ldmatrix` | ~610 `LDS`/`STS` | 3 `LDS` |
+
+HMMA is 1.8% of v4's loop and 10% of Triton's.
+
+### Where v4's instructions go
+
+**S and O live in shared memory.** v4 writes the `Q*K^T` fragment to `sS`, has 16
+lanes read it back row by row for the softmax, writes `P` to `sP`, then each
+`P*V` step loads the O accumulator from `sO`, runs one mma, and stores it back
+(`attention.cuh:551`, `:590-594`). Triton never spills them: `qk`, `p` and `acc`
+stay in registers in the mma accumulator layout for the whole loop. That costs
+registers (152-174 against v4's 64) and saves the round-trip.
+
+**The softmax is serial.** In v4, lane `r` owns row `r` and walks its 16 columns
+in a loop, while lanes 16-31 idle (`attention.cuh:555`). In Triton's mma
+layout each row is spread across a quad of 4 lanes, so a row max or row sum is
+two `SHFL.BFLY` steps. That's 8 shuffles per tile for both reductions on both rows
+a thread holds.
+
+**Every shmem access conflicts.** 82% of v4's shmem wavefronts are bank-conflict
+replays. Per-instruction source counters put them on every shmem opcode in the
+loop: `LDS.128`/`STS.128` (the O fragment load/store, 21% + 19%), `LDSM` (the Q/K/P
+fragment loads, 20% + 9.5%), and the scalar softmax `LDS`/`STS`. The cause is the
+stride: `D=64` rows are 128 B of FP16 or 256 B of FP32, both multiples of the
+128 B bank cycle, so every row of an 8x8 `ldmatrix` tile, and every lane in the
+softmax `sO_row[d] *= alpha`, lands on the same banks. Triton's shared layout is
+`#ttg.swizzled_shared<{vec = 8, perPhase = 1, maxPhase = 8}>`: 16-byte chunks
+XOR-permuted by `row % 8`, so it measures zero conflicts. That's the swizzle
+v5 has to do by hand.
+
+**Global loads are 2 bytes wide.** v4's cooperative K/V load indexes one `__half`
+per thread per iteration, giving `LDG.E.U16`. Triton's `#blocked` layout gives
+each thread 8 contiguous halves (`sizePerThread = [1, 8]`), so 16-byte loads. The
+bytes moved are identical (532,480 sectors on both), but v4 issues 8x the
+requests.
+
+### What `num_stages` does
+
+`num_stages=1` loads K/V with `LDG.E.128` into registers and `STS.128` into shmem,
+the same two-step pattern v4 uses. From `num_stages=2` up, the TTGIR switches to
+`ttg.async_copy_global_to_local` / `async_commit_group` / `async_wait`, which
+becomes `cp.async.cg.shared.global` (`LDGSTS.E.BYPASS.128`, bypassing L1) with
+`LDGDEPBAR` / `DEPBAR.LE` for the group waits. The prologue issues the first
+tiles before the loop and the loop body issues tile `n+1` while computing tile
+`n`. Shared memory goes from 16 KB to 40 KB for the extra buffers.
 
 The effect shows up in the stalls: long-scoreboard (waiting on global data) goes
 from 2.10 to 0.11 cycles per issue, and the Tensor pipe climbs from 22.6% to
@@ -629,52 +629,6 @@ ncu --set full -k regex:flash_attn_wmma_v4 -c 1 build\bin\attn.exe --N 2048 --D 
 `docs/asm/cuda_v4.{ptx,sass}` is the `flash_attn_wmma_v4_kernel<64,4>` entry cut
 out of `nvcc -arch=sm_120 -ptx` / `cuobjdump -sass` on `src/main.cu`. The two ncu
 reports are in `docs/profile/blackwell_*.ncu-rep`.
-
-## Requirements
-
-- An NVIDIA GPU. The `wmma` kernels need Tensor Cores (SM 7.0+); developed on Ada
-  (SM 8.9) and Blackwell (SM 12.0). The FP32 paths (naive, v1, v2) run anywhere.
-- CUDA Toolkit: 13.2 for the Blackwell build, 12.x for the Ada build.
-- References only: a CUDA `torch` build, plus `triton` (`triton-windows` on Windows)
-  for the Triton port.
-
-## Build & run
-
-```bat
-build_5070.bat                  REM Blackwell (sm_120, CUDA 13.2). build.bat is the older Ada/sm_89 setup.
-build\bin\attn.exe --N 2048 --D 64
-```
-
-All GPU kernels run, check against a CPU double-precision reference, and print
-per-call timings. naive through v4 run on head 0; v5 runs every head.
-
-PyTorch reference numbers:
-```bash
-python scripts\torch_bench.py
-```
-
-## Files
-
-```
-src/
-  attention.cuh   naive + flash v1 + v2 (Q-tile) + v3 (wmma BR=16) + v4 (wmma BR=64)
-  main.cu         harness: CPU ref, correctness diff, timing, FP32->FP16 conv kernel
-scripts/
-  torch_bench.py  PyTorch SDPA reference (FP32 + FP16)
-triton/
-  flash_triton.py Triton port, multi-head, validated vs torch SDPA
-  inspect_asm.py  dumps Triton TTGIR/PTX/SASS; --profile does one launch for ncu
-  autotune_sweep.py  times all 24 autotune configs per shape -> docs/autotune_sweep.csv
-  flash_bwd.py    backward: naive (materialized) and tiled (recompute from lse)
-  test_bwd.py     gradcheck (fp64) + fp16 grads vs fp32 reference
-  bwd_bench.py    backward timing + memory: naive vs tiled vs SDPA
-docs/profile/
-  flash.ncu-rep / qtile.ncu-rep / wmma.ncu-rep / wmma_v4.ncu-rep   Nsight Compute, v1-v4 (Ada)
-  blackwell_v4.ncu-rep / blackwell_triton.ncu-rep                  v4 vs Triton, --set full (Blackwell)
-docs/asm/
-  triton_s{1,3}.{ttgir,ptx,sass}   Triton output at num_stages=1 and 3
-  cuda_v4.{ptx,sass}               v4<64,4> from nvcc / cuobjdump
-```
 
 ## CUDA v5
 
@@ -705,6 +659,55 @@ about as long as v4 takes for a single head (0.270 ms).
 All heads match the CPU reference to the same error as v4 (max 5e-6), including
 `N=1000`, which exercises the tail tile.
 
+## Requirements
+
+- An NVIDIA GPU. The `wmma` kernels need Tensor Cores (SM 7.0+); developed on Ada
+  (SM 8.9) and Blackwell (SM 12.0). The FP32 paths (naive, v1, v2) run anywhere.
+- CUDA Toolkit: 13.2 for the Blackwell build, 12.x for the Ada build.
+- References only: a CUDA `torch` build, plus `triton` (`triton-windows` on Windows)
+  for the Triton port.
+
+## Build & run
+
+```bat
+build_5070.bat                  REM Blackwell (sm_120, CUDA 13.2). build.bat is the older Ada/sm_89 setup.
+build\bin\attn.exe --N 2048 --D 64
+build\bin\attn.exe --N 2048 --D 64 --B 1 --H 16
+```
+
+All GPU kernels run, check against a CPU double-precision reference, and print
+per-call timings. naive through v4 run on head 0; v5 runs every head.
+
+PyTorch reference numbers:
+```bash
+python scripts\torch_bench.py
+```
+
+## Files
+
+```
+src/
+  attention.cuh   naive + flash v1 + v2 (Q-tile) + v3 (wmma BR=16) + v4 (wmma BR=64)
+                  + v5 (v4 with [B, H, N, D])
+  main.cu         harness: CPU ref, correctness diff, timing, FP32->FP16 conv kernel
+scripts/
+  torch_bench.py  PyTorch SDPA reference (FP32 + FP16)
+triton/
+  flash_triton.py Triton port, multi-head, validated vs torch SDPA
+  inspect_asm.py  dumps Triton TTGIR/PTX/SASS; --profile does one launch for ncu
+  autotune_sweep.py  times all 24 autotune configs per shape -> docs/autotune_sweep.csv
+  flash_bwd.py    backward: naive (materialized) and tiled (recompute from lse)
+  test_bwd.py     gradcheck (fp64) + fp16 grads vs fp32 reference
+  bwd_bench.py    backward timing + memory: naive vs tiled vs SDPA
+  precision_exp.py  forward speed + error: FP16 vs BF16 vs FP8 (e4m3, e5m2)
+docs/profile/
+  flash.ncu-rep / qtile.ncu-rep / wmma.ncu-rep / wmma_v4.ncu-rep   Nsight Compute, v1-v4 (Ada)
+  blackwell_v4.ncu-rep / blackwell_triton.ncu-rep                  v4 vs Triton, --set full (Blackwell)
+docs/asm/
+  triton_s{1,3}.{ttgir,ptx,sass}   Triton output at num_stages=1 and 3
+  cuda_v4.{ptx,sass}               v4<64,4> from nvcc / cuobjdump
+```
+
 ## Scope and limitations
 
 A deliberately narrow study kernel, kept small so each optimization is isolated and
@@ -719,7 +722,6 @@ measurable:
 - **FP16 inputs on v3/v4**, FP32 accumulate. FP8 is Triton forward only, unscaled.
 - **Single GPU.** No multi-GPU or distributed.
 
-build\bin\attn.exe --N 2048 --D 64 --B 1 --H 16
 The goal was to take one kernel from a correct baseline to ~4x by profiling one
 bottleneck at a time, not to reimplement production FlashAttention-2.
 
@@ -727,5 +729,3 @@ bottleneck at a time, not to reimplement production FlashAttention-2.
 
 Developed on RTX 4080 Laptop (Ada, SM 8.9, 58 SMs, 12 GB, ~40 MB L2, 100 KB
 shmem/SM). Re-benchmarked on RTX 5070 Ti (Blackwell, SM 12.0).
-                  + v5 (v4 with [B, H, N, D])
-  precision_exp.py  forward speed + error: FP16 vs BF16 vs FP8 (e4m3, e5m2)
