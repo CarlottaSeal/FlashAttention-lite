@@ -642,6 +642,148 @@ inline void run_attention_flash_wmma_v4(const __half* dQ, const __half* dK, cons
     }
 }
 
+// v5: v4 plus a head dimension. Q/K/V/O are contiguous [B, H, N, D]; blockIdx.y
+// picks the (b, h) slice, so one launch covers every head.
+template <int D_EXACT, int NUM_WARPS>
+__global__ void flash_attn_v5_kernel(const __half* __restrict__ Q,
+                                     const __half* __restrict__ K,
+                                     const __half* __restrict__ V,
+                                     float*        __restrict__ O,
+                                     int N, float scale)
+{
+    size_t off = (size_t)blockIdx.y * N * D_EXACT;
+    Q += off; K += off; V += off; O += off;
+
+    using namespace nvcuda::wmma;
+    constexpr int WARP_BR = 16;
+    constexpr int BR = WARP_BR * NUM_WARPS;
+    constexpr int BC = 16;
+    constexpr int WM = 16, WN = 16, WK = 16;
+    static_assert(D_EXACT % WK == 0, "D must be a multiple of 16");
+    constexpr int D_TILES = D_EXACT / WK;
+    constexpr int T = NUM_WARPS * 32;
+
+    int tid     = threadIdx.x;
+    int warp_id = tid >> 5;
+    int lane    = tid & 31;
+    int i0      = blockIdx.x * BR;
+    int wr_base = warp_id * WARP_BR;
+
+    extern __shared__ unsigned char smem_raw[];
+    float*  sS = reinterpret_cast<float*>(smem_raw);
+    float*  sO = sS + BR * BC;
+    float*  sm = sO + BR * D_EXACT;
+    float*  sl = sm + BR;
+    __half* sQ = reinterpret_cast<__half*>(sl + BR);
+    __half* sK = sQ + BR * D_EXACT;
+    __half* sV = sK + BC * D_EXACT;
+    __half* sP = sV + BC * D_EXACT;
+
+    for (int k = tid; k < BR * D_EXACT; k += T) {
+        int r = k / D_EXACT, d = k % D_EXACT;
+        int row = i0 + r;
+        sQ[r * D_EXACT + d] = (row < N) ? Q[row * D_EXACT + d] : __float2half(0.0f);
+        sO[r * D_EXACT + d] = 0.0f;
+    }
+    if (tid < BR) { sm[tid] = -FLT_MAX; sl[tid] = 0.0f; }
+    __syncthreads();
+
+    for (int j0 = 0; j0 < N; j0 += BC)
+    {
+        int tile_rows = min(BC, N - j0);
+
+        for (int k = tid; k < BC * D_EXACT; k += T) {
+            int b = k / D_EXACT, d = k % D_EXACT;
+            sK[b * D_EXACT + d] = (b < tile_rows) ? K[(j0 + b) * D_EXACT + d] : __float2half(0.0f);
+            sV[b * D_EXACT + d] = (b < tile_rows) ? V[(j0 + b) * D_EXACT + d] : __float2half(0.0f);
+        }
+        __syncthreads();
+
+        fragment<accumulator, WM, WN, WK, float> s_frag;
+        fill_fragment(s_frag, 0.0f);
+        #pragma unroll
+        for (int kt = 0; kt < D_TILES; ++kt) {
+            fragment<matrix_a, WM, WN, WK, __half, row_major> a_frag;
+            fragment<matrix_b, WM, WN, WK, __half, col_major> b_frag;
+            load_matrix_sync(a_frag, sQ + wr_base * D_EXACT + kt * WK, D_EXACT);
+            load_matrix_sync(b_frag, sK + kt * WK,                     D_EXACT);
+            mma_sync(s_frag, a_frag, b_frag, s_frag);
+        }
+        store_matrix_sync(sS + wr_base * BC, s_frag, BC, mem_row_major);
+        __syncwarp();
+
+        if (lane < WARP_BR) {
+            int row = wr_base + lane;
+            float* sS_row = sS + row * BC;
+            __half* sP_row = sP + row * BC;
+            float* sO_row = sO + row * D_EXACT;
+
+            float m_tile = -FLT_MAX;
+            for (int j = 0; j < tile_rows; ++j) m_tile = fmaxf(m_tile, sS_row[j] * scale);
+            for (int j = tile_rows; j < BC; ++j) sS_row[j] = -FLT_MAX;
+
+            float m_old = sm[row];
+            float m_new = fmaxf(m_old, m_tile);
+            float alpha = expf(m_old - m_new);
+
+            float p_sum = 0.0f;
+            for (int j = 0; j < BC; ++j) {
+                float sv = sS_row[j];
+                float p  = (sv > -FLT_MAX / 2) ? expf(sv * scale - m_new) : 0.0f;
+                sP_row[j] = __float2half(p);
+                p_sum += p;
+            }
+            sl[row] = alpha * sl[row] + p_sum;
+            sm[row] = m_new;
+
+            #pragma unroll
+            for (int d = 0; d < D_EXACT; ++d) sO_row[d] *= alpha;
+        }
+        __syncthreads();
+
+        #pragma unroll
+        for (int kt = 0; kt < D_TILES; ++kt) {
+            fragment<accumulator, WM, WN, WK, float>          o_frag;
+            fragment<matrix_a, WM, WN, WK, __half, row_major> p_frag;
+            fragment<matrix_b, WM, WN, WK, __half, row_major> v_frag;
+            load_matrix_sync(o_frag, sO + wr_base * D_EXACT + kt * WK, D_EXACT, mem_row_major);
+            load_matrix_sync(p_frag, sP + wr_base * BC,                BC);
+            load_matrix_sync(v_frag, sV + kt * WK,                     D_EXACT);
+            mma_sync(o_frag, p_frag, v_frag, o_frag);
+            store_matrix_sync(sO + wr_base * D_EXACT + kt * WK, o_frag, D_EXACT, mem_row_major);
+        }
+        __syncthreads();
+    }
+
+    for (int k = tid; k < BR * D_EXACT; k += T) {
+        int r = k / D_EXACT, d = k % D_EXACT;
+        int row = i0 + r;
+        if (row < N)
+            O[row * D_EXACT + d] = sO[r * D_EXACT + d] / sl[r];
+    }
+}
+
+template <int D_EXACT>
+inline void launch_v5(const __half* dQ, const __half* dK, const __half* dV, float* dO,
+                      int BH, int N, cudaStream_t stream)
+{
+    constexpr int NUM_WARPS = 4, BR = 16 * NUM_WARPS;
+    constexpr size_t smem = flash_v4_smem_bytes<D_EXACT, NUM_WARPS>();
+    cudaFuncSetAttribute(flash_attn_v5_kernel<D_EXACT, NUM_WARPS>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
+    dim3 grid((N + BR - 1) / BR, BH);
+    flash_attn_v5_kernel<D_EXACT, NUM_WARPS><<<grid, NUM_WARPS * 32, smem, stream>>>(
+        dQ, dK, dV, dO, N, 1.0f / sqrtf((float)D_EXACT));
+}
+
+inline void run_attention_flash_v5(const __half* dQ, const __half* dK, const __half* dV,
+                                   float* dO, int BH, int N, int D, cudaStream_t stream = 0)
+{
+    if      (D == 64)  launch_v5<64>(dQ, dK, dV, dO, BH, N, stream);
+    else if (D == 128) launch_v5<128>(dQ, dK, dV, dO, BH, N, stream);
+    else std::fprintf(stderr, "run_attention_flash_v5: D=%d not in {64, 128}\n", D);
+}
+
 __global__ void float_to_half_kernel(const float* in, __half* out, int n)
 {
     int i = blockIdx.x * blockDim.x + threadIdx.x;

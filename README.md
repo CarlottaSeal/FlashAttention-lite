@@ -463,52 +463,6 @@ python triton/test_bwd.py    # gradcheck + fp16 error
 python triton/bwd_bench.py
 ```
 
-## Triton vs CUDA: under the hood
-
-Same shape for both, single head, `N=2048, D=64`, RTX 5070 Ti. Triton runs
-`BLOCK_M=64, BLOCK_N=64, num_warps=4`; v4 runs `BR=64, BC=16, 4 warps`. Both
-launch 32 CTAs of 128 threads, so the grid and the occupancy are identical and
-the gap comes entirely from what each warp does per K/V tile.
-
-| | CUDA v4 | Triton `num_stages=1` | Triton `num_stages=3` |
-|---|--:|--:|--:|
-| Wall-clock (CUDA events, 200 iters) | 0.457 ms | 0.044 ms | **0.037 ms** |
-| Kernel time under ncu (locked clocks) | 606 us | 61 us | 39 us |
-| Instructions executed | 14.1 M | 2.60 M | 2.60 M |
-| Tensor pipe (HMMA) utilization | 2.2% | 22.6% | **35.3%** |
-| Issue slots busy | 7.4% | 13.6% | 21.8% |
-| Global load requests (same 532,480 sectors) | 266,240 | 33,280 | 33,280 |
-| Shmem bank-conflict wavefronts / total | 19.4 M / 23.7 M | 0 / 0.77 M | 1 / 0.65 M |
-| Registers / thread | 64 | 174 | 152 |
-| Shared memory / block | 35 KB | 16 KB | 40 KB |
-| Stall per issue: long scoreboard | 3.22 | 2.10 | 0.11 |
-| Stall per issue: short scoreboard | 5.62 | 0.40 | 0.42 |
-| Stall per issue: math pipe throttle | 0.11 | 1.41 | 1.43 |
-
-Triton is ~12x faster than v4 on the same shape. Occupancy doesn't explain it
-(8.3% achieved warps on all three), and neither does the Tensor Core instruction.
-Everything else in the loop does.
-
-### The mma is the same instruction
-
-v4 calls `wmma::mma_sync` on 16x16x16 fragments, which PTX spells
-`wmma.mma.sync.aligned.m16n16k16`. Triton's `tl.dot` emits
-`mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32` directly. ptxas lowers both
-to the same SASS, `HMMA.16816.F32`: one wmma becomes two HMMAs. Operand loads
-match too: `wmma::load_matrix_sync` from shmem and Triton's operand loads both
-become `LDSM.16.M88.4` (`ldmatrix`), with `.MT88` for the transposed operand. The
-TTGIR shows `#ttg.nvidia_mma<{versionMajor = 2}>`, the Ampere-style `mma.sync`
-path. sm_120 doesn't have Hopper's `wgmma`, so there's no newer Tensor Core
-instruction that Triton is using and v4 isn't.
-
-What differs is how much work surrounds each HMMA. Inner loop only, normalized to
-64 keys (four v4 iterations against one Triton iteration):
-
-| Per 64 keys, per warp | CUDA v4 | Triton `num_stages=3` |
-|---|--:|--:|
-| SASS instructions | ~3,630 | ~620 |
-| `HMMA.16816.F32` | 64 | 64 |
-| `BAR.SYNC` | 12 | 2 |
 ### Precision: FP8 and BF16 vs FP16
 
 sm_120 takes FP8 in `tl.dot`. The same forward kernel, fed `float8_e4m3fn` inputs,
@@ -602,6 +556,52 @@ becomes `cp.async.cg.shared.global` (`LDGSTS.E.BYPASS.128`, bypassing L1) with
 `LDGDEPBAR` / `DEPBAR.LE` for the group waits. The prologue issues the first
 tiles before the loop and the loop body issues tile `n+1` while computing tile
 `n`. Shared memory goes from 16 KB to 40 KB for the extra buffers.
+## Triton vs CUDA: under the hood
+
+Same shape for both, single head, `N=2048, D=64`, RTX 5070 Ti. Triton runs
+`BLOCK_M=64, BLOCK_N=64, num_warps=4`; v4 runs `BR=64, BC=16, 4 warps`. Both
+launch 32 CTAs of 128 threads, so the grid and the occupancy are identical and
+the gap comes entirely from what each warp does per K/V tile.
+
+| | CUDA v4 | Triton `num_stages=1` | Triton `num_stages=3` |
+|---|--:|--:|--:|
+| Wall-clock (CUDA events, 200 iters) | 0.457 ms | 0.044 ms | **0.037 ms** |
+| Kernel time under ncu (locked clocks) | 606 us | 61 us | 39 us |
+| Instructions executed | 14.1 M | 2.60 M | 2.60 M |
+| Tensor pipe (HMMA) utilization | 2.2% | 22.6% | **35.3%** |
+| Issue slots busy | 7.4% | 13.6% | 21.8% |
+| Global load requests (same 532,480 sectors) | 266,240 | 33,280 | 33,280 |
+| Shmem bank-conflict wavefronts / total | 19.4 M / 23.7 M | 0 / 0.77 M | 1 / 0.65 M |
+| Registers / thread | 64 | 174 | 152 |
+| Shared memory / block | 35 KB | 16 KB | 40 KB |
+| Stall per issue: long scoreboard | 3.22 | 2.10 | 0.11 |
+| Stall per issue: short scoreboard | 5.62 | 0.40 | 0.42 |
+| Stall per issue: math pipe throttle | 0.11 | 1.41 | 1.43 |
+
+Triton is ~12x faster than v4 on the same shape. Occupancy doesn't explain it
+(8.3% achieved warps on all three), and neither does the Tensor Core instruction.
+Everything else in the loop does.
+
+### The mma is the same instruction
+
+v4 calls `wmma::mma_sync` on 16x16x16 fragments, which PTX spells
+`wmma.mma.sync.aligned.m16n16k16`. Triton's `tl.dot` emits
+`mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32` directly. ptxas lowers both
+to the same SASS, `HMMA.16816.F32`: one wmma becomes two HMMAs. Operand loads
+match too: `wmma::load_matrix_sync` from shmem and Triton's operand loads both
+become `LDSM.16.M88.4` (`ldmatrix`), with `.MT88` for the transposed operand. The
+TTGIR shows `#ttg.nvidia_mma<{versionMajor = 2}>`, the Ampere-style `mma.sync`
+path. sm_120 doesn't have Hopper's `wgmma`, so there's no newer Tensor Core
+instruction that Triton is using and v4 isn't.
+
+What differs is how much work surrounds each HMMA. Inner loop only, normalized to
+64 keys (four v4 iterations against one Triton iteration):
+
+| Per 64 keys, per warp | CUDA v4 | Triton `num_stages=3` |
+|---|--:|--:|
+| SASS instructions | ~3,630 | ~620 |
+| `HMMA.16816.F32` | 64 | 64 |
+| `BAR.SYNC` | 12 | 2 |
 
 The effect shows up in the stalls: long-scoreboard (waiting on global data) goes
 from 2.10 to 0.11 cycles per issue, and the Tensor pipe climbs from 22.6% to
@@ -645,8 +645,8 @@ build_5070.bat                  REM Blackwell (sm_120, CUDA 13.2). build.bat is 
 build\bin\attn.exe --N 2048 --D 64
 ```
 
-All four GPU kernels run, check against a CPU double-precision reference, and
-print per-call timings.
+All GPU kernels run, check against a CPU double-precision reference, and print
+per-call timings. naive through v4 run on head 0; v5 runs every head.
 
 PyTorch reference numbers:
 ```bash
@@ -676,19 +676,50 @@ docs/asm/
   cuda_v4.{ptx,sass}               v4<64,4> from nvcc / cuobjdump
 ```
 
+## CUDA v5
+
+v5 starts as a copy of v4 and changes one thing per step. v4 stays as it was, so
+the numbers above still reproduce.
+
+### Heads in one launch
+
+Q/K/V/O are contiguous `[B, H, N, D]`. The grid gets a second axis,
+`blockIdx.y = b*H + h`, and each block offsets its four pointers by
+`blockIdx.y * N * D`. Nothing else changes: a block still owns 64 query rows of
+one head.
+
+The comparison is v4 launched once per head vs v5 launched once (RTX 5070 Ti):
+
+| shape | v4, one launch per head | v5, one launch | speedup |
+|---|--:|--:|--:|
+| H=3, N=1000, D=64 | 0.973 ms | 0.265 ms | 3.7x |
+| H=16, N=2048, D=64 | 8.95 ms | 3.04 ms | 2.9x |
+| B=2, H=4, N=1024, D=128 | 3.83 ms | 0.834 ms | 4.6x |
+
+The kernel didn't get faster. The GPU got filled. One head at N=2048 is 32 blocks
+of 64 rows, on a 70-SM GPU, so most SMs sit idle and every launch is a short
+partial wave. Back-to-back launches on one stream don't overlap. At H=3, N=1000
+the three heads are 48 blocks together, still under one per SM, and v5 takes
+about as long as v4 takes for a single head (0.270 ms).
+
+All heads match the CPU reference to the same error as v4 (max 5e-6), including
+`N=1000`, which exercises the tail tile.
+
 ## Scope and limitations
 
 A deliberately narrow study kernel, kept small so each optimization is isolated and
 measurable:
 
 - **Backward is Triton-only.** The CUDA kernels are forward only.
-- **Single head, non-causal** on the CUDA side. The Triton port is multi-head
+- **Non-causal** on the CUDA side, and single head up to v4 (v5 takes
+  `[B, H, N, D]`). The Triton port is multi-head
   (`[Z, H, N, D]`) with an optional causal mask and tile skip.
 - **`D` in {64, 128}, a multiple of 16** to match the wmma tile width. Other head
   dimensions are unsupported on the wmma paths.
 - **FP16 inputs on v3/v4**, FP32 accumulate. FP8 is Triton forward only, unscaled.
 - **Single GPU.** No multi-GPU or distributed.
 
+build\bin\attn.exe --N 2048 --D 64 --B 1 --H 16
 The goal was to take one kernel from a correct baseline to ~4x by profiling one
 bottleneck at a time, not to reimplement production FlashAttention-2.
 
@@ -696,4 +727,5 @@ bottleneck at a time, not to reimplement production FlashAttention-2.
 
 Developed on RTX 4080 Laptop (Ada, SM 8.9, 58 SMs, 12 GB, ~40 MB L2, 100 KB
 shmem/SM). Re-benchmarked on RTX 5070 Ti (Blackwell, SM 12.0).
+                  + v5 (v4 with [B, H, N, D])
   precision_exp.py  forward speed + error: FP16 vs BF16 vs FP8 (e4m3, e5m2)
