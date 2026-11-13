@@ -509,6 +509,53 @@ What differs is how much work surrounds each HMMA. Inner loop only, normalized t
 | SASS instructions | ~3,630 | ~620 |
 | `HMMA.16816.F32` | 64 | 64 |
 | `BAR.SYNC` | 12 | 2 |
+### Precision: FP8 and BF16 vs FP16
+
+sm_120 takes FP8 in `tl.dot`. The same forward kernel, fed `float8_e4m3fn` inputs,
+lowers to `QMMA.16832.F32.E4M3` (k=32 per instruction, twice FP16's `HMMA.16816`).
+P is cast to the input dtype before `P @ V`, so it's FP8 too. Accumulation stays
+FP32 and the output is FP16. No scaling factors: `randn` inputs sit well inside
+e4m3's range (max 448).
+
+Forward only, Z=1, H=16, best of three tile configs per dtype. Error is mean |d|
+against fp32 SDPA on the original fp32 inputs, so it includes input rounding.
+
+| N | D | causal | FP16 ms | BF16 | e4m3 | e5m2 | FP16 err | BF16 err | e4m3 err | e5m2 err |
+|--:|--:|:-:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 1024 | 64 | | 0.063 | 0.96x | 1.29x | 1.28x | 1.9e-5 | 1.5e-4 | 2.2e-3 | 4.3e-3 |
+| 8192 | 64 | | 3.29 | 1.00x | **1.63x** | 1.67x | 6.8e-6 | 5.5e-5 | 7.9e-4 | 1.6e-3 |
+| 8192 | 128 | | 6.42 | 1.01x | **1.67x** | 1.67x | 6.7e-6 | 5.4e-5 | 7.8e-4 | 1.5e-3 |
+| 8192 | 64 | yes | 1.75 | 0.98x | **1.42x** | 1.39x | 1.3e-5 | 1.0e-4 | 1.5e-3 | 3.0e-3 |
+| 8192 | 128 | yes | 3.70 | 0.99x | **1.74x** | 1.72x | 1.3e-5 | 1.0e-4 | 1.5e-3 | 2.9e-3 |
+
+Speedup is relative to FP16. FP8 reaches 143 TFLOPS at N=8192, D=128, against 86 for FP16.
+
+- **BF16 buys nothing here.** Same HMMA rate as FP16, so the same speed, with 8x the
+  error. That's 2^3, the gap between 7 and 10 mantissa bits. Its advantage is range,
+  which attention inputs at this scale don't need.
+- **FP8 is 1.3-1.7x, not 2x.** The matmuls do twice the work per instruction, but
+  the softmax (max, exp, rescale) is the same amount of work. D=128 sits at
+  1.6-1.75x throughout. D=64 has less matmul per softmax element and gets less: 1.3x
+  at N=1024, 1.3-1.4x causal.
+- **The error follows mantissa bits.** e4m3 (3 bits) is 116x FP16's error, against
+  2^7 = 128. e5m2 (2 bits) is 228x, against 2^8 = 256. e5m2 is as fast as e4m3 and
+  twice as wrong, so e4m3 is the one to use for the forward.
+- **Most of the FP8 error is input rounding.** At N=4096, D=64, rounding Q/K/V to
+  e4m3 and then computing in fp32 already gives 9.9e-4. The kernel adds another
+  5.2e-4 on top. With FP16 inputs that in-kernel part is 5.7e-6, so it comes from
+  casting P to FP8. Keeping P in FP16 could recover at most that smaller share.
+- **Causal max error is large: 0.15 for e4m3.** The first rows attend to only a few
+  keys, so their output is close to a single row of V, and V's rounding comes
+  straight through without averaging out. Row 0's output is exactly `v[0]`.
+
+Real activations have outliers, so a production FP8 path needs per-tensor or
+per-block scales (FlashAttention-3 does this). None of that is here, and the backward
+stays FP16.
+
+```bash
+python triton/precision_exp.py
+```
+
 | Global loads | 56x `LDG.E.U16` (2 B) | 8x `LDGSTS.E.BYPASS.128` (16 B, `cp.async`) |
 | Shmem traffic outside `ldmatrix` | ~610 `LDS`/`STS` | 3 `LDS` |
 
@@ -639,7 +686,7 @@ measurable:
   (`[Z, H, N, D]`) with an optional causal mask and tile skip.
 - **`D` in {64, 128}, a multiple of 16** to match the wmma tile width. Other head
   dimensions are unsupported on the wmma paths.
-- **FP16 inputs on v3/v4**, FP32 accumulate. No FP8 path yet.
+- **FP16 inputs on v3/v4**, FP32 accumulate. FP8 is Triton forward only, unscaled.
 - **Single GPU.** No multi-GPU or distributed.
 
 The goal was to take one kernel from a correct baseline to ~4x by profiling one
@@ -649,3 +696,4 @@ bottleneck at a time, not to reimplement production FlashAttention-2.
 
 Developed on RTX 4080 Laptop (Ada, SM 8.9, 58 SMs, 12 GB, ~40 MB L2, 100 KB
 shmem/SM). Re-benchmarked on RTX 5070 Ti (Blackwell, SM 12.0).
+  precision_exp.py  forward speed + error: FP16 vs BF16 vs FP8 (e4m3, e5m2)

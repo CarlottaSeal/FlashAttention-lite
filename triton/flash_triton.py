@@ -96,18 +96,18 @@ def _flash_fwd(Q, K, V, sm_scale, Out, LSE,
              acc.to(Out.dtype.element_ty), mask=offs_m[:, None] < N)
 
 
-def flash_attn(q, k, v, causal=False, skip=True, BLOCK_M=64, BLOCK_N=64, return_lse=False):
+def flash_attn(q, k, v, causal=False, skip=True, BLOCK_M=64, BLOCK_N=64, return_lse=False, **launch):
     Z, H, N, D = q.shape
     assert BLOCK_M % BLOCK_N == 0   # 对角线起点要落在 BLOCK_N 边界上
     sm_scale = 1.0 / (D ** 0.5)
-    o = torch.empty_like(q)
+    o = torch.empty_like(q, dtype=torch.float16 if q.element_size() == 1 else q.dtype)   # fp8 进，fp16 出
     lse = torch.empty(Z, H, N, device=q.device,
                       dtype=torch.float64 if q.dtype == torch.float64 else torch.float32)
     grid = (triton.cdiv(N, BLOCK_M), Z * H)
     _flash_fwd[grid](q, k, v, sm_scale, o, lse,
                      *q.stride(), *k.stride(), *v.stride(), *o.stride(),
                      H, N, BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, D=D,
-                     CAUSAL=causal, SKIP=skip)
+                     CAUSAL=causal, SKIP=skip, **launch)
     return (o, lse) if return_lse else o
 
 
