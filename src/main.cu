@@ -81,12 +81,14 @@ int main(int argc, char** argv)
     int N = 512;
     int D = 64;
     int B = 1, H = 1;
+    int BC = 0;    // v5 K/V tile, 0 = per-D default
     int seed = 42;
     for (int i = 1; i < argc; ++i) {
         if      (std::strcmp(argv[i], "--N") == 0 && i + 1 < argc) N = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--D") == 0 && i + 1 < argc) D = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--B") == 0 && i + 1 < argc) B = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--H") == 0 && i + 1 < argc) H = std::atoi(argv[++i]);
+        else if (std::strcmp(argv[i], "--BC") == 0 && i + 1 < argc) BC = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--seed") == 0 && i + 1 < argc) seed = std::atoi(argv[++i]);
     }
     const int BH = B * H;
@@ -128,7 +130,7 @@ int main(int argc, char** argv)
     auto run_qtile   = [&]() { run_attention_flash_qtile(dQ, dK, dV, dO, N, D); };
     auto run_wmma    = [&]() { run_attention_flash_wmma(dQh, dKh, dVh, dO, N, D); };
     auto run_wmma_v4 = [&]() { run_attention_flash_wmma_v4(dQh, dKh, dVh, dO, N, D); };
-    auto run_v5      = [&]() { run_attention_flash_v5(dQh, dKh, dVh, dO, BH, N, D); };
+    auto run_v5      = [&]() { run_attention_flash_v5(dQh, dKh, dVh, dO, BH, N, D, BC); };
     auto run_v4_loop = [&]() {   // v4 launched once per head, for comparison with v5
         for (int h = 0; h < BH; ++h)
             run_attention_flash_wmma_v4(dQh + h * ND, dKh + h * ND, dVh + h * ND, dO + h * ND, N, D);

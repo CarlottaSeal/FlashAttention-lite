@@ -632,8 +632,8 @@ reports are in `docs/profile/blackwell_*.ncu-rep`.
 
 ## CUDA v5
 
-v5 starts as a copy of v4 and changes one thing per step. v4 stays as it was, so
-the numbers above still reproduce.
+v5 starts as a copy of v4 and is changed one step at a time, each measured against
+the previous one. v4 stays as it was, so the numbers above still reproduce.
 
 ### Heads in one launch
 
@@ -722,6 +722,67 @@ An intermediate version did the rescale one float per lane. It removed the same
 conflicts but executed 20-30% more instructions, so D=128 barely moved. `float4`
 fixed that.
 
+### mma.sync, registers, XOR swizzle
+
+To swizzle, the shmem accesses have to be hand-written, and once wmma is gone
+there's no reason to keep S, P and O in shmem either. So this step changes three
+things together, the FA-2 structure:
+
+- **`mma.sync.m16n8k16` and `ldmatrix` by hand** instead of wmma. It's the same
+  `HMMA.16816.F32` underneath (A1).
+- **S, P, O in registers.** Each warp keeps its 16 Q rows as A fragments for the
+  whole loop. S comes out of the mma in accumulator layout. Row max and row sum
+  reduce across the 4 lanes that share a row with two `shfl.xor`. The accumulator
+  layout of S n-tiles `2k, 2k+1` is exactly the A-fragment layout for k-step `k`,
+  so P is packed to `half2` and fed straight into `O += P V`. V is read with
+  `ldmatrix.trans`. sS, sP, sO and the `sa` array are gone. Shared memory is only
+  Q, K, V.
+- **XOR swizzle on Q/K/V.** A row is `D/8` chunks of 16 B, and chunk `c` of row
+  `r` is stored at `c ^ (r % 8)`. An `ldmatrix` phase reads the same logical chunk
+  from 8 consecutive rows, which now land on 8 different bank groups without any
+  padding.
+
+The global loads stay scalar `LDG.E.U16` so that B3 changes only the loads. The
+K/V tile `BC` is a template parameter. `BC=16` is v4's tile, now on registers.
+
+ncu kernel time, H=16, best of 3. The GPU drifted between 0.9 and 2.3 GHz even
+with `--clock-control base`, so every row is compared at matching clocks, and the
+N=4096, D=128 row (1.9-2.1 GHz) is in cycles:
+
+| shape | padded (B2a) | BC=16 | BC=32 | BC=64 | vs B2a |
+|---|--:|--:|--:|--:|--:|
+| N=2048, D=64 | 1.83 ms | 0.549 | 0.386 | **0.361** | 5.1x |
+| N=4096, D=64 | 6.34 ms | 1.72 | **1.32** | **1.32** | 4.8x |
+| N=2048, D=128 | 6.85 ms | 1.64 | **0.957** | 1.23 | 7.2x |
+| N=4096, D=128 | 51.7 M cyc | 12.5 M | **7.29 M** | 8.71 M | 7.1x |
+
+| `N=2048, H=16` (ncu) | B2a D=64 | v5 D=64, BC=64 | B2a D=128 | v5 D=128, BC=32 |
+|---|--:|--:|--:|--:|
+| Bank-conflict wavefronts | 10.7 M | 0.21 M | 10.6 M | 0.28 M |
+| Instructions | 239 M | 113 M | 338 M | 202 M |
+| Registers / thread | 48 | 128 | 60 | 165 |
+| Achieved warps | 15.8% | 30.4% | 8.3% | 22.0% |
+| Issue slots busy | 21.9% | 51.1% | 8.6% | 34.8% |
+| Stall/issue: short scoreboard | 2.51 | 0.09 | 2.56 | 0.13 |
+| Stall/issue: long scoreboard | 2.12 | 2.40 | 5.18 | 3.23 |
+
+- **This step's speedup isn't attributable to the swizzle alone.** Most of it is
+  what's no longer done: no S/P/O stores and reloads, no serial 16-lane softmax,
+  no rescale pass. Instructions drop 53% at D=64 and 40% at D=128. Padding had
+  already removed 97% of the
+  conflicts. The swizzle's job here is to keep the last ones out without padding,
+  now that every shmem access is an `ldmatrix`.
+- **Occupancy went up, not down,** despite 128-231 registers per thread. Shared
+  memory per block fell from 41/70 KB to 24/32 KB (`(64 + 2*BC) * D * 2 B`).
+- **BC trades loop overhead against registers.** BC=16 pays one `__syncthreads`
+  pair and one softmax pass per 16 keys. BC=64 at D=128 needs 231 registers,
+  which allows only 2 blocks per SM, so BC=32 (165 registers, 3 blocks) wins there.
+  The default is BC=64 for D=64 and BC=32 for D=128. No spills in any config.
+- **What's left is global loads.** Shared-memory stalls are gone (short
+  scoreboard ~0.1). Long scoreboard is now the largest stall, and the loads are
+  still one half per thread per instruction, issued and then waited on before any
+  compute starts.
+
 ## Requirements
 
 - An NVIDIA GPU. The `wmma` kernels need Tensor Cores (SM 7.0+); developed on Ada
@@ -736,6 +797,7 @@ fixed that.
 build_5070.bat                  REM Blackwell (sm_120, CUDA 13.2). build.bat is the older Ada/sm_89 setup.
 build\bin\attn.exe --N 2048 --D 64
 build\bin\attn.exe --N 2048 --D 64 --B 1 --H 16
+build\bin\attn.exe --N 2048 --D 128 --H 16 --BC 64     REM v5 K/V tile, default 64 (D=64) / 32 (D=128)
 ```
 
 All GPU kernels run, check against a CPU double-precision reference, and print
@@ -751,7 +813,7 @@ python scripts\torch_bench.py
 ```
 src/
   attention.cuh   naive + flash v1 + v2 (Q-tile) + v3 (wmma BR=16) + v4 (wmma BR=64)
-                  + v5 (v4 with [B, H, N, D], padded shmem)
+                  + v5 ([B, H, N, D], mma.sync + ldmatrix, S/P/O in registers, swizzled shmem)
   main.cu         harness: CPU ref, correctness diff, timing, FP32->FP16 conv kernel
 scripts/
   torch_bench.py  PyTorch SDPA reference (FP32 + FP16)

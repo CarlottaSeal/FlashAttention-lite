@@ -2,6 +2,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <mma.h>
+#include <math_constants.h>
 #include <cmath>
 #include <cfloat>
 
@@ -642,174 +643,212 @@ inline void run_attention_flash_wmma_v4(const __half* dQ, const __half* dK, cons
     }
 }
 
-// v5: v4 plus a head dimension. Q/K/V/O are contiguous [B, H, N, D]; blockIdx.y
-// picks the (b, h) slice, so one launch covers every head.
-//
-// Shared tiles are padded so rows don't land on the same banks: a 128 B row
-// stride puts every row of a 16-row tile on the same 32 banks. wmma only takes a
-// linear layout plus ldm, so padding is the fix available here.
-template <int D_EXACT>
-struct V5Smem {
-    static constexpr int BR = 64, BC = 16;
-    static constexpr int LDQ = D_EXACT + 8;   // halves; Q/K/V, row stride 144 B at D=64
-    static constexpr int LDP = BC + 8;        // halves
-    static constexpr int LDS = BC + 4;        // floats; lane-per-row reads go 8-way -> 2-way
-    static constexpr int LDO = D_EXACT + 8;   // floats; +4 leaves the accumulator LDS.64 2-way
-    static constexpr size_t bytes =
-        ((size_t)BR * LDS + (size_t)BR * LDO + 3 * BR) * sizeof(float) +
-        ((size_t)BR * LDQ + 2 * (size_t)BC * LDQ + (size_t)BR * LDP) * sizeof(__half);
-};
-
-template <int D_EXACT, int NUM_WARPS>
-__global__ void flash_attn_v5_kernel(const __half* __restrict__ Q,
-                                     const __half* __restrict__ K,
-                                     const __half* __restrict__ V,
-                                     float*        __restrict__ O,
-                                     int N, float scale)
+// v5: FA-2 structure on raw mma.sync. Q/K/V are contiguous [B, H, N, D];
+// blockIdx.y picks the (b, h) slice. Each warp owns 16 query rows. S, P and O
+// live in registers; only Q/K/V go through shared memory, XOR-swizzled so that
+// ldmatrix reads 8 rows from 8 different 16 B bank groups.
+__device__ __forceinline__ uint32_t smem_u32(const void* p)
 {
-    size_t off = (size_t)blockIdx.y * N * D_EXACT;
+    return (uint32_t)__cvta_generic_to_shared(p);
+}
+
+__device__ __forceinline__ void ldsm_x4(uint32_t* r, const __half* p)
+{
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(smem_u32(p)));
+}
+
+__device__ __forceinline__ void ldsm_x4_t(uint32_t* r, const __half* p)
+{
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(smem_u32(p)));
+}
+
+// c(16x8 f32) += a(16x16 f16, row) * b(16x8 f16, col)
+__device__ __forceinline__ void mma16816(float* c, const uint32_t* a, uint32_t b0, uint32_t b1)
+{
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+__device__ __forceinline__ uint32_t pack_half2(float x, float y)
+{
+    __half2 h = __floats2half2_rn(x, y);
+    return *reinterpret_cast<uint32_t*>(&h);
+}
+
+// Row r of a [rows, D] half tile is D/8 chunks of 16 B; chunk c is stored at c ^ (r % 8).
+template <int D>
+__device__ __forceinline__ int swz(int r, int d)
+{
+    return r * D + ((((d >> 3) ^ r) & 7) | ((d >> 3) & ~7)) * 8 + (d & 7);
+}
+
+template <int D, int BC>
+__global__ void __launch_bounds__(128)
+flash_attn_v5_kernel(const __half* __restrict__ Q,
+                     const __half* __restrict__ K,
+                     const __half* __restrict__ V,
+                     float*        __restrict__ O,
+                     int N, float scale)
+{
+    constexpr int BR = 64, T = 128;
+    constexpr int KD = D / 16;    // k-steps over D for S = QK^T
+    constexpr int NS = BC / 8;    // n-tiles of S
+    constexpr int NO = D / 8;     // n-tiles of O
+    static_assert(D % 16 == 0 && BC % 16 == 0, "");
+
+    size_t off = (size_t)blockIdx.y * N * D;
     Q += off; K += off; V += off; O += off;
 
-    using namespace nvcuda::wmma;
-    using L = V5Smem<D_EXACT>;
-    constexpr int WARP_BR = 16;
-    constexpr int BR = WARP_BR * NUM_WARPS;
-    constexpr int BC = L::BC;
-    constexpr int LDQ = L::LDQ, LDP = L::LDP, LDS = L::LDS, LDO = L::LDO;
-    constexpr int WM = 16, WN = 16, WK = 16;
-    static_assert(D_EXACT % WK == 0, "D must be a multiple of 16");
-    static_assert(BR == L::BR, "smem layout assumes 4 warps");
-    constexpr int D_TILES = D_EXACT / WK;
-    constexpr int T = NUM_WARPS * 32;
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    __half* sQ = reinterpret_cast<__half*>(smem_raw);
+    __half* sK = sQ + BR * D;
+    __half* sV = sK + BC * D;
 
-    int tid     = threadIdx.x;
-    int warp_id = tid >> 5;
-    int lane    = tid & 31;
-    int i0      = blockIdx.x * BR;
-    int wr_base = warp_id * WARP_BR;
+    int tid  = threadIdx.x;
+    int lane = tid & 31;
+    int wr   = (tid >> 5) * 16;   // this warp's first row in the tile
+    int g    = lane >> 2;         // accumulator row (and row + 8)
+    int t    = lane & 3;          // accumulator column pair
+    int i0   = blockIdx.x * BR;
 
-    extern __shared__ unsigned char smem_raw[];
-    float*  sS = reinterpret_cast<float*>(smem_raw);
-    float*  sO = sS + BR * LDS;
-    float*  sm = sO + BR * LDO;
-    float*  sl = sm + BR;
-    float*  sa = sl + BR;                       // per-row rescale factor
-    __half* sQ = reinterpret_cast<__half*>(sa + BR);
-    __half* sK = sQ + BR * LDQ;
-    __half* sV = sK + BC * LDQ;
-    __half* sP = sV + BC * LDQ;
-
-    for (int k = tid; k < BR * D_EXACT; k += T) {
-        int r = k / D_EXACT, d = k % D_EXACT;
-        int row = i0 + r;
-        sQ[r * LDQ + d] = (row < N) ? Q[row * D_EXACT + d] : __float2half(0.0f);
-        sO[r * LDO + d] = 0.0f;
+    for (int k = tid; k < BR * D; k += T) {
+        int r = k / D, d = k % D;
+        sQ[swz<D>(r, d)] = (i0 + r < N) ? Q[(i0 + r) * D + d] : __float2half(0.0f);
     }
-    if (tid < BR) { sm[tid] = -FLT_MAX; sl[tid] = 0.0f; }
     __syncthreads();
+
+    uint32_t qf[KD][4];
+    #pragma unroll
+    for (int kk = 0; kk < KD; ++kk)
+        ldsm_x4(qf[kk], sQ + swz<D>(wr + (lane & 15), kk * 16 + (lane >> 4) * 8));
+
+    float o[NO][4] = {};
+    float m[2] = { -CUDART_INF_F, -CUDART_INF_F };
+    float l[2] = { 0.0f, 0.0f };   // per-thread partial row sums, reduced at the end
 
     for (int j0 = 0; j0 < N; j0 += BC)
     {
-        int tile_rows = min(BC, N - j0);
-
-        for (int k = tid; k < BC * D_EXACT; k += T) {
-            int b = k / D_EXACT, d = k % D_EXACT;
-            sK[b * LDQ + d] = (b < tile_rows) ? K[(j0 + b) * D_EXACT + d] : __float2half(0.0f);
-            sV[b * LDQ + d] = (b < tile_rows) ? V[(j0 + b) * D_EXACT + d] : __float2half(0.0f);
+        __syncthreads();   // everyone is done reading the previous K/V tile
+        for (int k = tid; k < BC * D; k += T) {
+            int b = k / D, d = k % D;
+            bool in = j0 + b < N;
+            sK[swz<D>(b, d)] = in ? K[(j0 + b) * D + d] : __float2half(0.0f);
+            sV[swz<D>(b, d)] = in ? V[(j0 + b) * D + d] : __float2half(0.0f);
         }
         __syncthreads();
 
-        fragment<accumulator, WM, WN, WK, float> s_frag;
-        fill_fragment(s_frag, 0.0f);
+        // S = Q K^T. One ldmatrix.x4 gives the B fragments of two 8-key n-tiles.
+        float s[NS][4] = {};
         #pragma unroll
-        for (int kt = 0; kt < D_TILES; ++kt) {
-            fragment<matrix_a, WM, WN, WK, __half, row_major> a_frag;
-            fragment<matrix_b, WM, WN, WK, __half, col_major> b_frag;
-            load_matrix_sync(a_frag, sQ + wr_base * LDQ + kt * WK, LDQ);
-            load_matrix_sync(b_frag, sK + kt * WK,                 LDQ);
-            mma_sync(s_frag, a_frag, b_frag, s_frag);
-        }
-        store_matrix_sync(sS + wr_base * LDS, s_frag, LDS, mem_row_major);
-        __syncwarp();
-
-        if (lane < WARP_BR) {
-            int row = wr_base + lane;
-            float* sS_row = sS + row * LDS;
-            __half* sP_row = sP + row * LDP;
-
-            float m_tile = -FLT_MAX;
-            for (int j = 0; j < tile_rows; ++j) m_tile = fmaxf(m_tile, sS_row[j] * scale);
-            for (int j = tile_rows; j < BC; ++j) sS_row[j] = -FLT_MAX;
-
-            float m_old = sm[row];
-            float m_new = fmaxf(m_old, m_tile);
-            float alpha = expf(m_old - m_new);
-
-            float p_sum = 0.0f;
-            for (int j = 0; j < BC; ++j) {
-                float sv = sS_row[j];
-                float p  = (sv > -FLT_MAX / 2) ? expf(sv * scale - m_new) : 0.0f;
-                sP_row[j] = __float2half(p);
-                p_sum += p;
+        for (int kk = 0; kk < KD; ++kk) {
+            #pragma unroll
+            for (int nb = 0; nb < NS / 2; ++nb) {
+                uint32_t b[4];
+                ldsm_x4(b, sK + swz<D>(nb * 16 + (lane & 7) + (lane >> 4) * 8,
+                                       kk * 16 + ((lane >> 3) & 1) * 8));
+                mma16816(s[2 * nb],     qf[kk], b[0], b[1]);
+                mma16816(s[2 * nb + 1], qf[kk], b[2], b[3]);
             }
-            sl[row] = alpha * sl[row] + p_sum;
-            sm[row] = m_new;
-            sa[row] = alpha;
         }
-        __syncwarp();
 
-        // 整个 warp 按列缩放自己的 16 行：相邻 lane 访问相邻地址，不再一 lane 一行
-        constexpr int D4 = D_EXACT / 4;
-        for (int k = lane; k < WARP_BR * D4; k += 32) {
-            int row = wr_base + k / D4;
-            float4* o4 = reinterpret_cast<float4*>(sO + row * LDO) + k % D4;
-            float a = sa[row];
-            float4 o = *o4;
-            o.x *= a; o.y *= a; o.z *= a; o.w *= a;
-            *o4 = o;
-        }
-        __syncthreads();
-
+        // Online softmax on registers. s[n][0..1] is row g, s[n][2..3] is row g+8;
+        // the 4 lanes of a quad hold the rest of each row.
+        float mx[2] = { m[0], m[1] };
         #pragma unroll
-        for (int kt = 0; kt < D_TILES; ++kt) {
-            fragment<accumulator, WM, WN, WK, float>          o_frag;
-            fragment<matrix_a, WM, WN, WK, __half, row_major> p_frag;
-            fragment<matrix_b, WM, WN, WK, __half, row_major> v_frag;
-            load_matrix_sync(o_frag, sO + wr_base * LDO + kt * WK, LDO, mem_row_major);
-            load_matrix_sync(p_frag, sP + wr_base * LDP,           LDP);
-            load_matrix_sync(v_frag, sV + kt * WK,                 LDQ);
-            mma_sync(o_frag, p_frag, v_frag, o_frag);
-            store_matrix_sync(sO + wr_base * LDO + kt * WK, o_frag, LDO, mem_row_major);
+        for (int n = 0; n < NS; ++n)
+            #pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                int col = j0 + n * 8 + 2 * t + (e & 1);
+                s[n][e] = (col < N) ? s[n][e] * scale : -CUDART_INF_F;
+                mx[e >> 1] = fmaxf(mx[e >> 1], s[n][e]);
+            }
+        float alpha[2];
+        #pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            mx[i] = fmaxf(mx[i], __shfl_xor_sync(0xffffffff, mx[i], 1));
+            mx[i] = fmaxf(mx[i], __shfl_xor_sync(0xffffffff, mx[i], 2));
+            alpha[i] = expf(m[i] - mx[i]);
+            m[i] = mx[i];
+            l[i] *= alpha[i];
         }
-        __syncthreads();
+        #pragma unroll
+        for (int n = 0; n < NS; ++n)
+            #pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                s[n][e] = expf(s[n][e] - m[e >> 1]);
+                l[e >> 1] += s[n][e];
+            }
+        #pragma unroll
+        for (int n = 0; n < NO; ++n)
+            #pragma unroll
+            for (int e = 0; e < 4; ++e) o[n][e] *= alpha[e >> 1];
+
+        // O += P V. The S accumulators of n-tiles 2k, 2k+1 are exactly the A
+        // fragment for k-step k, so P never leaves registers.
+        #pragma unroll
+        for (int kk = 0; kk < BC / 16; ++kk) {
+            uint32_t a[4] = { pack_half2(s[2 * kk][0],     s[2 * kk][1]),
+                              pack_half2(s[2 * kk][2],     s[2 * kk][3]),
+                              pack_half2(s[2 * kk + 1][0], s[2 * kk + 1][1]),
+                              pack_half2(s[2 * kk + 1][2], s[2 * kk + 1][3]) };
+            #pragma unroll
+            for (int nb = 0; nb < NO / 2; ++nb) {
+                uint32_t b[4];
+                ldsm_x4_t(b, sV + swz<D>(kk * 16 + (lane & 7) + ((lane >> 3) & 1) * 8,
+                                         nb * 16 + (lane >> 4) * 8));
+                mma16816(o[2 * nb],     a, b[0], b[1]);
+                mma16816(o[2 * nb + 1], a, b[2], b[3]);
+            }
+        }
     }
 
-    for (int k = tid; k < BR * D_EXACT; k += T) {
-        int r = k / D_EXACT, d = k % D_EXACT;
-        int row = i0 + r;
-        if (row < N)
-            O[row * D_EXACT + d] = sO[r * LDO + d] / sl[r];
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        l[i] += __shfl_xor_sync(0xffffffff, l[i], 1);
+        l[i] += __shfl_xor_sync(0xffffffff, l[i], 2);
+    }
+    int r0 = i0 + wr + g, r1 = r0 + 8;
+    #pragma unroll
+    for (int n = 0; n < NO; ++n) {
+        int c = n * 8 + 2 * t;
+        if (r0 < N) *reinterpret_cast<float2*>(O + r0 * D + c) = make_float2(o[n][0] / l[0], o[n][1] / l[0]);
+        if (r1 < N) *reinterpret_cast<float2*>(O + r1 * D + c) = make_float2(o[n][2] / l[1], o[n][3] / l[1]);
     }
 }
 
-template <int D_EXACT>
+template <int D, int BC>
 inline void launch_v5(const __half* dQ, const __half* dK, const __half* dV, float* dO,
                       int BH, int N, cudaStream_t stream)
 {
-    constexpr int NUM_WARPS = 4, BR = 16 * NUM_WARPS;
-    constexpr size_t smem = V5Smem<D_EXACT>::bytes;
-    cudaFuncSetAttribute(flash_attn_v5_kernel<D_EXACT, NUM_WARPS>,
+    constexpr int BR = 64;
+    constexpr size_t smem = (size_t)(BR + 2 * BC) * D * sizeof(__half);
+    cudaFuncSetAttribute(flash_attn_v5_kernel<D, BC>,
                          cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
     dim3 grid((N + BR - 1) / BR, BH);
-    flash_attn_v5_kernel<D_EXACT, NUM_WARPS><<<grid, NUM_WARPS * 32, smem, stream>>>(
-        dQ, dK, dV, dO, N, 1.0f / sqrtf((float)D_EXACT));
+    flash_attn_v5_kernel<D, BC><<<grid, 128, smem, stream>>>(dQ, dK, dV, dO, N,
+                                                            1.0f / sqrtf((float)D));
+}
+
+template <int D>
+inline void launch_v5_bc(const __half* dQ, const __half* dK, const __half* dV, float* dO,
+                         int BH, int N, int BC, cudaStream_t stream)
+{
+    if      (BC == 16) launch_v5<D, 16>(dQ, dK, dV, dO, BH, N, stream);
+    else if (BC == 32) launch_v5<D, 32>(dQ, dK, dV, dO, BH, N, stream);
+    else               launch_v5<D, 64>(dQ, dK, dV, dO, BH, N, stream);
 }
 
 inline void run_attention_flash_v5(const __half* dQ, const __half* dK, const __half* dV,
-                                   float* dO, int BH, int N, int D, cudaStream_t stream = 0)
+                                   float* dO, int BH, int N, int D, int BC = 0,
+                                   cudaStream_t stream = 0)
 {
-    if      (D == 64)  launch_v5<64>(dQ, dK, dV, dO, BH, N, stream);
-    else if (D == 128) launch_v5<128>(dQ, dK, dV, dO, BH, N, stream);
+    if (BC == 0) BC = (D == 64) ? 64 : 32;   // D=128, BC=64 needs 231 regs -> 2 blocks/SM
+    if      (D == 64)  launch_v5_bc<64>(dQ, dK, dV, dO, BH, N, BC, stream);
+    else if (D == 128) launch_v5_bc<128>(dQ, dK, dV, dO, BH, N, BC, stream);
     else std::fprintf(stderr, "run_attention_flash_v5: D=%d not in {64, 128}\n", D);
 }
 
