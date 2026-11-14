@@ -659,6 +659,69 @@ about as long as v4 takes for a single head (0.270 ms).
 All heads match the CPU reference to the same error as v4 (max 5e-6), including
 `N=1000`, which exercises the tail tile.
 
+### Bank conflicts: padding first
+
+A1 measured 82% of v4's shared wavefronts as conflict replays. Nsight's source
+view splits that by line (`N=2048, D=64, H=16`, 310 M excess wavefronts):
+
+| where | excess / total wavefronts |
+|---|--:|
+| softmax rescale, `sO_row[d] *= alpha` | 117 M / 134 M |
+| wmma loads of Q, K, V, P (`LDSM`) | 92 M / 109 M |
+| wmma accumulator load/store of S and O (`LDS.64` / `STS.64`) | 59 M / 80 M |
+| softmax reads of S, writes of P | 48 M / 59 M |
+
+The biggest one isn't a wmma access at all. In the rescale, each of 16 lanes owns
+one row of O, and rows are 256 B apart, so all 16 lanes hit the same bank. Every
+tile row stride is a multiple of 128 B, which is what makes the rest conflict.
+
+XOR swizzling can't be used with these accesses. `wmma::load_matrix_sync` takes
+a linear layout and a leading dimension, nothing else. So this step pads, and the
+swizzle comes with hand-written `ldmatrix` next:
+
+- **Rescale moved to the whole warp, `float4` per lane.** Adjacent lanes touch
+  adjacent addresses. Alpha goes through a 64-float `sa` array.
+- **Q/K/V rows padded to `D+8` halves** (144 B at D=64). The 8 rows an `ldmatrix`
+  phase reads land on 8 different 16 B segments.
+- **O rows padded to `D+8` floats.** With `D+4` the accumulator `LDS.64` /
+  `STS.64` stayed 2-way in the source view (19 M excess). `D+8` removed it.
+- **S rows padded to 20 floats.** S is written by the accumulator and read one row
+  per lane, and those want different strides. 20 makes the row reads 2-way
+  instead of 8-way.
+
+Same occupancy as before: 41 KB/block at D=64 (2 blocks/SM), 70 KB at D=128
+(1 block/SM).
+
+| `N=2048, H=16` (ncu) | B1, D=64 | padded, D=64 | B1, D=128 | padded, D=128 |
+|---|--:|--:|--:|--:|
+| Bank-conflict wavefronts | 311 M | **10.7 M** | 570 M | **10.6 M** |
+| Shared wavefronts total | 380 M | 82 M | 694 M | 140 M |
+| Instructions | 245 M | 239 M | 349 M | 338 M |
+| Stall/issue: short scoreboard | 8.17 | 2.52 | 6.88 | 2.56 |
+| Stall/issue: long scoreboard | 1.00 | 2.27 | 2.88 | **5.34** |
+| Kernel time | 2.85 ms | **1.73 ms** | 7.34 ms | **6.00 ms** |
+
+Wall-clock against B1, same session:
+
+| shape | B1 | padded | speedup |
+|---|--:|--:|--:|
+| H=3, N=1000, D=64 | 0.218 ms | 0.151 ms | 1.44x |
+| H=16, N=2048, D=64 | 2.50 ms | 1.30 ms | 1.93x |
+| H=16, N=4096, D=64 | 9.61 ms | 4.98 ms | 1.93x |
+| H=16, N=2048, D=128 | 6.43 ms | 4.91 ms | 1.31x |
+| H=16, N=4096, D=128 | 24.2 ms | 19.2 ms | 1.26x |
+
+D=128 gains less, and the stall table says why. Shared-memory waits went down
+(short scoreboard 6.9 to 2.6), but waits on global loads went up (long scoreboard
+2.9 to 5.3). With one block per SM there are only 4 warps to hide the scalar
+`LDG.E.U16` loads of K and V, so once the shared-memory stalls are gone the global
+load latency is what's left exposed. Overlapping those loads with compute is the
+job of `cp.async`.
+
+An intermediate version did the rescale one float per lane. It removed the same
+conflicts but executed 20-30% more instructions, so D=128 barely moved. `float4`
+fixed that.
+
 ## Requirements
 
 - An NVIDIA GPU. The `wmma` kernels need Tensor Cores (SM 7.0+); developed on Ada
@@ -688,7 +751,7 @@ python scripts\torch_bench.py
 ```
 src/
   attention.cuh   naive + flash v1 + v2 (Q-tile) + v3 (wmma BR=16) + v4 (wmma BR=64)
-                  + v5 (v4 with [B, H, N, D])
+                  + v5 (v4 with [B, H, N, D], padded shmem)
   main.cu         harness: CPU ref, correctness diff, timing, FP32->FP16 conv kernel
 scripts/
   torch_bench.py  PyTorch SDPA reference (FP32 + FP16)
